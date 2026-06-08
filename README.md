@@ -155,3 +155,4 @@ This project is open source. See [LICENSE](LICENSE) for details.
 - [Adafruit GFX Library](https://github.com/adafruit/Adafruit-GFX-Library) for the display rendering framework
 - [WeatherAPI.com](https://www.weatherapi.com/) for the weather data API
 - [DSEG Font](https://www.keshikan.net/fonts-e.html) for the digital clock typeface
+- https://github.com/juanjocastillo/Waveshare-RLCD-ESP32S3-Dashboard-v12_1
