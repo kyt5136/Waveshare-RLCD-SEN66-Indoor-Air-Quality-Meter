@@ -70,6 +70,30 @@ Verify:
 9. Navigation audio and alarm audio operate independently.
 10. `secrets.h` remains untracked.
 
+### Forced CO2 calibration
+
+Use this procedure only when there is a justified need to replace the stored
+CO2 correction:
+
+1. Place the complete powered SEN66 assembly outdoors in open, well-mixed air.
+2. Keep it away from people, vehicles, combustion exhaust, doors, windows,
+   HVAC outlets, and direct wind gusts.
+3. Confirm that the configured WeatherAPI latitude/longitude describes the
+   sensor location.
+4. Open the root web page and select the outdoor-placement confirmation.
+5. Press **Start 5-Min Calibration**.
+6. Confirm that the displayed pressure was freshly downloaded and accepted.
+7. Leave the unit undisturbed. The timer advances only while reported CO2
+   remains in the 350-450 ppm reference band and restarts after any excursion.
+8. Wait for the success result and recorded correction. Do not remove power
+   while the state is `calibrating`.
+9. Return the unit indoors only after continuous measurement has restarted.
+
+The firmware issues an FRC target of 400 ppm. This changes persistent sensor
+configuration and survives reset or power loss. Ordinary outdoor air is not a
+traceable 400 ppm calibration gas; use a controlled reference for metrological
+work.
+
 ## 4. Common faults
 
 ### SEN66 does not respond at `0x6B`
@@ -110,6 +134,15 @@ This is expected. Weather location and POSIX time zone are independent. Modify `
 - confirm port 80 is not blocked;
 - verify Wi-Fi connection state.
 
+### Outdoor calibration will not start or never completes
+
+- verify Wi-Fi is connected and WeatherAPI returns `pressure_mb`;
+- confirm the active weather location matches the physical site;
+- inspect Serial Monitor for `SEN66 FRC` and I2C error messages;
+- keep the CO2 reading continuously between 350 and 450 ppm for five minutes;
+- move people and combustion sources away from the sensor;
+- do not expect the device to infer outdoor placement from its measurements.
+
 ## 5. Update discipline
 
 Before upgrading a dependency:
@@ -131,4 +164,3 @@ Before upgrading a dependency:
 - Do not calibrate battery state-of-charge from the displayed voltage alone.
 - Treat step changes in VOC/NOx indices as events requiring context, not automatic identification of a specific gas.
 - Retain regulatory or reference-grade instruments for any safety-critical decision.
-

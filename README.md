@@ -60,6 +60,7 @@ The web interface stores a page-inclusion mask in NVS. Unchecked pages are skipp
 The ESP32 serves an unauthenticated HTTP interface on its LAN address. Available controls include:
 
 - immediate WeatherAPI refresh
+- guarded outdoor SEN66 forced-CO2 recalibration using freshly downloaded local pressure
 - immediate NTP synchronization
 - weather location replacement using decimal `latitude,longitude`
 - automatic LCD page cycling and dwell time
@@ -166,5 +167,7 @@ No project-wide open-source license is asserted here because the immediate upstr
 - Current PM-derived AQI is not equivalent to the prescribed 24-hour AQI reporting process.
 - VOC Index and NOx Index are dimensionless processed indicators, not gas concentrations.
 - CO2, VOC, and NOx outputs require sensor startup and conditioning time.
+- Forced CO2 recalibration is persistent. Use the web workflow only with the
+  complete SEN66 outdoors in a homogeneous, known 400 ppm reference environment.
 - Battery voltage thresholds are approximate and are not a fuel-gauge algorithm.
 - The web interface must not be exposed directly to the public internet.

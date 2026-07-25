@@ -141,6 +141,7 @@ struct WeatherData {
   String windDir;
   float  uvIndex;
   float  precipMM;
+  float  pressureHpa;
   int    airQualityIndex;
   String airQualityText;
   float  pm25;
@@ -174,6 +175,30 @@ struct Sen66Data {
   unsigned long lastUpdate;
   char serialNumber[32];
 } indoor;
+
+enum Co2CalibrationState : uint8_t {
+  CO2_CAL_IDLE,
+  CO2_CAL_STABILIZING,
+  CO2_CAL_EXECUTING,
+  CO2_CAL_SUCCESS,
+  CO2_CAL_FAILED
+};
+
+static const uint16_t CO2_CAL_TARGET_PPM = 400;
+static const uint16_t CO2_CAL_MIN_PPM = 350;
+static const uint16_t CO2_CAL_MAX_PPM = 450;
+static const unsigned long CO2_CAL_STABILIZE_MS = 300000UL;
+
+struct Co2CalibrationStatus {
+  Co2CalibrationState state;
+  unsigned long qualifyingSince;
+  float pressureHpa;
+  uint16_t correctionRaw;
+  char message[128];
+} co2Calibration = {
+  CO2_CAL_IDLE, 0, NAN, 0,
+  "Ready. Move the sensor outdoors before starting."
+};
 
 struct HourlyData {
   float  temp[6];
@@ -758,6 +783,106 @@ bool readSen66() {
   return true;
 }
 
+const char* co2CalibrationStateName() {
+  switch (co2Calibration.state) {
+    case CO2_CAL_STABILIZING: return "stabilizing";
+    case CO2_CAL_EXECUTING:   return "calibrating";
+    case CO2_CAL_SUCCESS:     return "success";
+    case CO2_CAL_FAILED:      return "failed";
+    default:                  return "idle";
+  }
+}
+
+bool co2InCalibrationBand() {
+  return indoor.valid && indoor.co2 != 0xFFFF &&
+         indoor.co2 >= CO2_CAL_MIN_PPM && indoor.co2 <= CO2_CAL_MAX_PPM;
+}
+
+void failCo2Calibration(const char* message) {
+  co2Calibration.state = CO2_CAL_FAILED;
+  co2Calibration.qualifyingSince = 0;
+  strncpy(co2Calibration.message, message, sizeof(co2Calibration.message) - 1);
+  co2Calibration.message[sizeof(co2Calibration.message) - 1] = '\0';
+  Serial.printf("[SEN66 FRC] %s\n", co2Calibration.message);
+}
+
+void executeCo2Calibration() {
+  co2Calibration.state = CO2_CAL_EXECUTING;
+  strncpy(co2Calibration.message, "Applying forced CO2 recalibration...",
+          sizeof(co2Calibration.message) - 1);
+
+  int16_t stopError = sen66.stopMeasurement();
+  if (stopError != NO_ERROR) {
+    char message[96];
+    snprintf(message, sizeof(message),
+             "Could not stop SEN66 measurement (error %d).", stopError);
+    failCo2Calibration(message);
+    return;
+  }
+
+  // SEN6x datasheet requires at least 1400 ms in idle mode before FRC.
+  delay(1500);
+  uint16_t correction = 0;
+  int16_t frcError =
+    sen66.performForcedCo2Recalibration(CO2_CAL_TARGET_PPM, correction);
+  int16_t startError = sen66.startContinuousMeasurement();
+  indoor.valid = false;
+  lastSensorReadMs = millis();
+
+  if (frcError != NO_ERROR || correction == 0xFFFF) {
+    char message[112];
+    snprintf(message, sizeof(message),
+             "Forced calibration failed (error %d, result 0x%04X). Measurement restart: %s.",
+             frcError, correction, startError == NO_ERROR ? "OK" : "FAILED");
+    failCo2Calibration(message);
+    return;
+  }
+  if (startError != NO_ERROR) {
+    char message[96];
+    snprintf(message, sizeof(message),
+             "Calibration was stored, but measurement restart failed (error %d).", startError);
+    failCo2Calibration(message);
+    return;
+  }
+
+  co2Calibration.correctionRaw = correction;
+  co2Calibration.state = CO2_CAL_SUCCESS;
+  co2Calibration.qualifyingSince = 0;
+  int32_t correctionPpm = (int32_t)correction - 0x8000;
+  snprintf(co2Calibration.message, sizeof(co2Calibration.message),
+           "Calibration complete at %u ppm. Applied correction: %ld ppm.",
+           CO2_CAL_TARGET_PPM, (long)correctionPpm);
+  Serial.printf("[SEN66 FRC] %s Pressure %.0f hPa.\n",
+                co2Calibration.message, co2Calibration.pressureHpa);
+}
+
+void serviceCo2Calibration() {
+  if (co2Calibration.state != CO2_CAL_STABILIZING) return;
+
+  if (!co2InCalibrationBand()) {
+    co2Calibration.qualifyingSince = 0;
+    snprintf(co2Calibration.message, sizeof(co2Calibration.message),
+             "Waiting for a continuous %u-%u ppm outdoor reading; current CO2 is %s.",
+             CO2_CAL_MIN_PPM, CO2_CAL_MAX_PPM,
+             indoor.valid && indoor.co2 != 0xFFFF ?
+             String(indoor.co2).c_str() : "unavailable");
+    return;
+  }
+
+  unsigned long now = millis();
+  if (co2Calibration.qualifyingSince == 0) {
+    co2Calibration.qualifyingSince = now;
+  }
+  unsigned long elapsed = now - co2Calibration.qualifyingSince;
+  unsigned long remaining =
+    elapsed >= CO2_CAL_STABILIZE_MS ? 0 :
+    (CO2_CAL_STABILIZE_MS - elapsed + 999) / 1000;
+  snprintf(co2Calibration.message, sizeof(co2Calibration.message),
+           "Outdoor reference is in range. Keep the sensor undisturbed for %lu more seconds.",
+           remaining);
+  if (elapsed >= CO2_CAL_STABILIZE_MS) executeCo2Calibration();
+}
+
 // ===== BATTERY =====
 float readBatteryVoltage() {
   int raw = analogRead(BAT_ADC_PIN);
@@ -850,6 +975,7 @@ bool fetchWeatherData() {
   weatherData.windDir     = pstr  ("\"wind_dir\":\"",  curPos);
   weatherData.condition   = pstr  ("\"text\":\"",      curPos);
   weatherData.precipMM    = pfloat("\"precip_mm\":",   curPos, fcastPos);
+  weatherData.pressureHpa = pfloat("\"pressure_mb\":", curPos, fcastPos);
 
   {
     int uvPos = payload.indexOf("\"uv\":", curPos);
@@ -2452,6 +2578,23 @@ void handleRoot() {
     "<button class='btn' onclick=\"fetch('/refresh').then(()=>location.reload())\">Refresh Weather</button>"
     "<button class='btn sec' onclick=\"fetch('/syncntp').then(()=>location.reload())\">Sync NTP</button>"
     "<a class='btn sec' href='/timers'>Timers</a></div></div>"
+    "<div class='card'><h2>Outdoor SEN66 CO2 Calibration</h2>"
+    "<div class='k'>Persistent forced recalibration to a 400 ppm outdoor reference. The station first downloads "
+    "current local pressure, applies pressure compensation, and then requires five uninterrupted minutes with "
+    "the SEN66 reading in the 350-450 ppm reference band. Leaving the band restarts the timer.</div>"
+    "<div class='row' style='margin-top:10px'>" +
+    metric("Current CO2", indoor.valid && indoor.co2!=0xFFFF ?
+           String(indoor.co2)+" ppm" : "--") +
+    metric("Downloaded pressure", weatherData.valid && weatherData.pressureHpa>0 ?
+           String(weatherData.pressureHpa,0)+" hPa" : "--") +
+    "</div>"
+    "<div class='sw' style='margin-top:10px'><span class='swlbl'>I confirm the complete SEN66 unit is outdoors "
+    "in open, well-mixed air and away from people, vehicles, vents, and combustion sources.</span>"
+    "<label class='switch'><input type='checkbox' id='cal_outdoor'><span class='slider'></span></label></div>"
+    "<div class='row' style='margin-top:10px'>"
+    "<button class='btn' id='cal_start' onclick='startCo2Calibration()'>Start 5-Min Calibration</button>"
+    "<button class='btn sec' id='cal_cancel' onclick='cancelCo2Calibration()'>Cancel</button></div>"
+    "<div id='cal_status' class='k' style='margin-top:10px'>Loading calibration status...</div></div>"
     "<div class='card'><h2>Weather Location</h2>"
     "<div class='k'>Enter decimal latitude and longitude, for example 40.7128,-74.0060.</div>"
     "<div class='row' style='margin-top:10px'>"
@@ -2494,6 +2637,22 @@ void handleRoot() {
     "fetch('/setweatherlocation?v='+encodeURIComponent(v)).then(async r=>{let t=await r.text();"
     "if(!r.ok)throw new Error(t);s.textContent='Location saved. Fetching new weather data.';"
     "setTimeout(()=>location.reload(),2500)}).catch(e=>s.textContent=e.message)}"
+    "async function startCo2Calibration(){let s=document.getElementById('cal_status');"
+    "if(!document.getElementById('cal_outdoor').checked){s.textContent='Confirm that the complete sensor is outdoors first.';return;}"
+    "if(!confirm('This writes a persistent forced CO2 calibration to the SEN66. Keep it outdoors and undisturbed for five minutes. Continue?'))return;"
+    "s.textContent='Downloading current pressure...';"
+    "try{let r=await fetch('/co2cal/start?confirmed=true',{method:'POST'});let t=await r.text();"
+    "if(!r.ok)throw new Error(t);s.textContent=t;pollCo2Calibration()}catch(e){s.textContent=e.message}}"
+    "async function cancelCo2Calibration(){let r=await fetch('/co2cal/cancel',{method:'POST'});"
+    "document.getElementById('cal_status').textContent=await r.text();pollCo2Calibration()}"
+    "async function pollCo2Calibration(){try{let r=await fetch('/co2cal/status');let d=await r.json();"
+    "let extra=d.state==='stabilizing'?' Remaining: '+d.remaining_sec+' s.':'';"
+    "document.getElementById('cal_status').textContent=d.message+extra+' CO2: '+"
+    "(d.co2===null?'--':d.co2)+' ppm; pressure: '+(d.pressure_hpa===null?'--':d.pressure_hpa)+' hPa.';"
+    "let busy=d.state==='stabilizing'||d.state==='calibrating';"
+    "document.getElementById('cal_start').disabled=busy;"
+    "document.getElementById('cal_cancel').disabled=!busy||d.state==='calibrating';}catch(e){}}"
+    "setInterval(pollCo2Calibration,1000);pollCo2Calibration();"
     "</script>"
     "</div></body></html>";
   webServer.send(200, "text/html; charset=utf-8", html);
@@ -2697,6 +2856,91 @@ void handleSetWeatherLocation() {
 void handleRefresh() {
   webRefreshWeather = true;
   webServer.send(200, "text/plain", "ok");
+}
+
+void handleCo2CalibrationStart() {
+  if (!webServer.hasArg("confirmed") || webServer.arg("confirmed") != "true") {
+    webServer.send(400, "text/plain", "Outdoor placement confirmation is required.");
+    return;
+  }
+  if (co2Calibration.state == CO2_CAL_STABILIZING ||
+      co2Calibration.state == CO2_CAL_EXECUTING) {
+    webServer.send(409, "text/plain", "A calibration workflow is already running.");
+    return;
+  }
+  if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
+    webServer.send(503, "text/plain", "Wi-Fi is required to download local pressure.");
+    return;
+  }
+  if (!indoor.valid || indoor.co2 == 0xFFFF) {
+    webServer.send(503, "text/plain", "The SEN66 does not have a valid CO2 reading.");
+    return;
+  }
+
+  // Deliberately fetch now: calibration may not use cached pressure.
+  if (!fetchWeatherData() || weatherData.pressureHpa < 700.0f ||
+      weatherData.pressureHpa > 1200.0f) {
+    webServer.send(502, "text/plain",
+                   "Could not retrieve a valid 700-1200 hPa local pressure from WeatherAPI.");
+    return;
+  }
+
+  uint16_t pressureHpa = (uint16_t)lroundf(weatherData.pressureHpa);
+  int16_t pressureError = sen66.setAmbientPressure(pressureHpa);
+  if (pressureError != NO_ERROR) {
+    char message[96];
+    snprintf(message, sizeof(message),
+             "SEN66 rejected pressure compensation (error %d).", pressureError);
+    webServer.send(500, "text/plain", message);
+    return;
+  }
+
+  co2Calibration.state = CO2_CAL_STABILIZING;
+  co2Calibration.pressureHpa = pressureHpa;
+  co2Calibration.correctionRaw = 0;
+  co2Calibration.qualifyingSince = co2InCalibrationBand() ? millis() : 0;
+  snprintf(co2Calibration.message, sizeof(co2Calibration.message),
+           "Pressure %.0f hPa applied. Waiting for five continuous minutes in the %u-%u ppm band.",
+           co2Calibration.pressureHpa, CO2_CAL_MIN_PPM, CO2_CAL_MAX_PPM);
+  Serial.printf("[SEN66 FRC] Outdoor workflow started at %.0f hPa.\n",
+                co2Calibration.pressureHpa);
+  webServer.send(202, "text/plain", co2Calibration.message);
+}
+
+void handleCo2CalibrationCancel() {
+  if (co2Calibration.state == CO2_CAL_EXECUTING) {
+    webServer.send(409, "text/plain", "Calibration is being written and cannot be cancelled.");
+    return;
+  }
+  co2Calibration.state = CO2_CAL_IDLE;
+  co2Calibration.qualifyingSince = 0;
+  strncpy(co2Calibration.message, "Calibration cancelled.",
+          sizeof(co2Calibration.message) - 1);
+  co2Calibration.message[sizeof(co2Calibration.message) - 1] = '\0';
+  webServer.send(200, "text/plain", co2Calibration.message);
+}
+
+void handleCo2CalibrationStatus() {
+  unsigned long remaining = CO2_CAL_STABILIZE_MS / 1000;
+  if (co2Calibration.state == CO2_CAL_STABILIZING &&
+      co2Calibration.qualifyingSince != 0) {
+    unsigned long elapsed = millis() - co2Calibration.qualifyingSince;
+    remaining = elapsed >= CO2_CAL_STABILIZE_MS ?
+                0 : (CO2_CAL_STABILIZE_MS - elapsed + 999) / 1000;
+  }
+  String co2Value = indoor.valid && indoor.co2 != 0xFFFF ?
+                    String(indoor.co2) : String("null");
+  String pressureValue = isnan(co2Calibration.pressureHpa) ?
+                         String("null") : String(co2Calibration.pressureHpa, 0);
+  String json = "{\"state\":\"" + String(co2CalibrationStateName()) +
+                "\",\"remaining_sec\":" + String(remaining) +
+                ",\"co2\":" + co2Value +
+                ",\"pressure_hpa\":" + pressureValue +
+                ",\"in_reference_band\":" +
+                String(co2InCalibrationBand() ? "true" : "false") +
+                ",\"message\":\"" + String(co2Calibration.message) + "\"}";
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(200, "application/json", json);
 }
 
 // GET /syncntp — trigger NTP re-sync on next loop()
@@ -3094,6 +3338,9 @@ void startWebServer() {
   webServer.on("/setcyclesec", handleSetCycleSec);
   webServer.on("/setweatherlocation", handleSetWeatherLocation);
   webServer.on("/refresh",     handleRefresh);
+  webServer.on("/co2cal/start", HTTP_POST, handleCo2CalibrationStart);
+  webServer.on("/co2cal/cancel", HTTP_POST, handleCo2CalibrationCancel);
+  webServer.on("/co2cal/status", HTTP_GET, handleCo2CalibrationStatus);
   webServer.on("/syncntp",     handleSyncNTP);
   webServer.on("/setsleep",      handleSetSleep);
   webServer.on("/wakenow",       handleWakeNow);
@@ -3276,6 +3523,7 @@ void loop() {
     }
     if (wifiConnected) { wifiRSSI=WiFi.RSSI(); Serial.printf(" WiFi=%d",wifiRSSI); }
     Serial.println();
+    serviceCo2Calibration();
   }
   if (now - lastBatteryReadMs >= 10000UL) {
     lastBatteryReadMs=now;

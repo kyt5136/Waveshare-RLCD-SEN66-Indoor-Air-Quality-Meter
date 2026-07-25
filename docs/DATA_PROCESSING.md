@@ -135,15 +135,38 @@ Outdoor PM2.5 AQI is recalculated locally through the same PM2.5 interpolation r
 
 API schema reference: [WeatherAPI documentation](https://www.weatherapi.com/docs/).
 
-## 7. Hourly selection
+## 7. Pressure-assisted forced CO2 recalibration
+
+The web calibration workflow parses WeatherAPI `current.pressure_mb`, validates
+700-1200 hPa, rounds it to an integer hPa, and sends it through
+`setAmbientPressure()` before the outdoor stabilization period. Cached pressure
+is not accepted when a calibration is started.
+
+Qualification requires five uninterrupted minutes with valid reported CO2 in
+the 350-450 ppm band. An invalid frame or excursion resets the timer. The
+firmware then stops continuous measurement, waits 1500 ms, performs forced
+recalibration with a 400 ppm target, checks both the I2C result and the
+`0xFFFF` failure sentinel, and restarts continuous measurement.
+
+The correction reported by the library is converted for display as:
+
+```text
+correction_ppm = returned_uint16 - 0x8000
+```
+
+The FRC is persistent in the sensor. Pressure compensation is applied before
+qualification because pressure changes the CO2 measurement. The system cannot
+independently verify outdoor placement or establish a traceable reference-gas
+concentration.
+
+## 8. Hourly selection
 
 The parser scans up to 72 hourly records across the three forecast days. It selects the first six records with `time_epoch` later than the current system epoch. This allows the list to cross midnight rather than restarting at 00:00 or stopping at the end of the first forecast day.
 
 System time is preferred. WeatherAPI `localtime_epoch` is used as a fallback if system time is not valid.
 
-## 8. History buffers
+## 9. History buffers
 
 Temperature and humidity histories contain 24 entries sampled every 15 minutes. At capacity, each graph represents six hours. History is RAM-resident and is reset at boot.
 
 The firmware seeds the arrays at startup so the graph has defined numeric content, but it does not claim those seeded entries are historical observations. Operational interpretation should begin after real samples have accumulated.
-

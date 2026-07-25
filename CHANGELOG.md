@@ -1,5 +1,13 @@
 # Change Log
 
+## Outdoor CO2 calibration workflow - 2026-07-25
+
+- Added a guarded forced-CO2 recalibration control to the main web page.
+- Added a mandatory fresh WeatherAPI pressure download and SEN66 ambient-pressure compensation.
+- Added a five-minute continuous 350-450 ppm outdoor qualification window.
+- Added automatic stop, 1500 ms idle wait, 400 ppm FRC, result validation, and measurement restart.
+- Added live calibration status, cancellation before the write, Serial diagnostics, and operating documentation.
+
 ## SEN66 engineering revision - 2026-07-24
 
 - Replaced the onboard SHTC3 data path with complete Sensirion SEN66 acquisition.
@@ -16,4 +24,3 @@
 - Localized seasons and time-zone presentation for North America and the Northern Hemisphere.
 - Removed space-weather, lunar, aurora, and ATS-radio subsystems from the inherited dashboard.
 - Added architecture, hardware, data-processing, web-interface, operations, security, and attribution documentation.
-

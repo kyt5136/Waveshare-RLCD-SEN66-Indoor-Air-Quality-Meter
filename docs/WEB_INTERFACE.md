@@ -15,7 +15,10 @@ The ESP32 listens on TCP port 80 after joining the configured Wi-Fi network. The
 
 ## 3. Control endpoints
 
-The current implementation uses HTTP GET requests for state-changing operations. This is expedient for an embedded LAN tool but is not appropriate for exposure outside a trusted network.
+Most legacy controls use HTTP GET requests for state-changing operations. The
+calibration controls use POST because they initiate a persistent sensor change.
+Neither pattern is appropriate for exposure outside a trusted network without
+authentication and request-origin protection.
 
 | Endpoint | Parameters | Effect |
 |---|---|---|
@@ -29,6 +32,9 @@ The current implementation uses HTTP GET requests for state-changing operations.
 | `/setinvert` | `v` | changes display inversion |
 | `/setweatherlocation` | `v` | validates and stores decimal latitude/longitude |
 | `/refresh` | none | schedules WeatherAPI refresh |
+| `/co2cal/start` (POST) | `confirmed=true` | downloads pressure and begins the guarded five-minute outdoor calibration |
+| `/co2cal/cancel` (POST) | none | cancels qualification before the FRC write starts |
+| `/co2cal/status` (GET) | none | returns calibration state, countdown, CO2, pressure, and reference-band status |
 | `/syncntp` | none | schedules NTP synchronization |
 | `/setsleep` | schedule arguments | stores display-sleep configuration |
 | `/wakenow` | none | temporarily wakes the display |
@@ -56,7 +62,27 @@ Validation enforces:
 
 The stored value replaces the compiled `weatherLocation` default for future WeatherAPI requests. It does not change the Wi-Fi credentials, API key, POSIX time zone, or `secrets.h`.
 
-## 5. NVS namespace
+## 5. SEN66 outdoor calibration control
+
+The root page contains a persistent forced-CO2 recalibration control. The
+operator must confirm that the complete SEN66 assembly is outdoors. Starting
+the workflow then:
+
+1. requires an active Wi-Fi connection and valid SEN66 CO2 frame;
+2. performs a new WeatherAPI request for the configured latitude/longitude;
+3. validates `pressure_mb` as 700-1200 hPa;
+4. sends that pressure to the SEN66 before qualification;
+5. requires five continuous minutes between 350 and 450 ppm;
+6. resets the timer whenever the reading is invalid or outside the band;
+7. stops continuous measurement, waits 1500 ms, performs FRC at 400 ppm, and
+   restarts continuous measurement.
+
+The outdoor checkbox is an operator attestation. The device cannot determine
+whether it is physically outdoors or whether the reference atmosphere is
+traceable. The returned correction and failure state are shown in the web
+status text and Serial Monitor.
+
+## 6. NVS namespace
 
 Namespace: `dash`
 
@@ -83,7 +109,7 @@ Namespace: `dash`
 
 Runtime countdown and stopwatch progress are not persisted across reset.
 
-## 6. Page inclusion behavior
+## 7. Page inclusion behavior
 
 - A checked page is available to short/long hardware-button navigation and auto-cycle.
 - An unchecked page is skipped.
@@ -91,7 +117,7 @@ Runtime countdown and stopwatch progress are not persisted across reset.
 - At least one page must remain checked.
 - Alarm/timer firing can force page 12.
 
-## 7. Audio separation
+## 8. Audio separation
 
 `beep_en` controls page-change clicks only.
 
@@ -99,7 +125,7 @@ Runtime countdown and stopwatch progress are not persisted across reset.
 
 Both flags are persistent. Disabling either flag does not remove the relevant visual state.
 
-## 8. Recommended hardening
+## 9. Recommended hardening
 
 For any network other than a controlled home/lab LAN:
 
@@ -110,4 +136,3 @@ For any network other than a controlled home/lab LAN:
 - avoid returning SSID or precise location data to unauthenticated clients;
 - migrate mutating endpoints to authenticated POST requests;
 - apply request-rate limits.
-
