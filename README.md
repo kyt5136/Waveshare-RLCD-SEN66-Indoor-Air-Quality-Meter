@@ -1,158 +1,170 @@
-# Waveshare RLCD ESP32-S3 Weather Dashboard
+# Waveshare-RLCD SEN66 Indoor Air Quality Meter
 
-A data-rich, 12-page time and weather dashboard built on an **ESP32-S3** microcontroller, driving a **400×300 monochrome reflective LCD (RLCD)**. Combines live weather API data, on-board environmental sensing, RTC timekeeping, and original astronomical diagram designs — all rendered in crisp 1-bit monochrome.
+Firmware and operating documentation for a desktop indoor-air-quality station built on the Waveshare ESP32-S3-RLCD-4.2 and a Sensirion SEN66 connected to the board's external I2C bus.
 
----
+The SEN66 is the authoritative source for indoor temperature, relative humidity, carbon dioxide, VOC Index, NOx Index, and particulate-matter measurements. WeatherAPI supplies outdoor conditions, forecasts, sunrise and sunset, and outdoor PM2.5 data. The 400 x 300 reflective LCD presents thirteen local pages; an embedded HTTP interface provides configuration, page selection, timer/alarm control, and live data inspection.
 
-## ✨ Features
+## Engineering status
 
-- **12 display pages** cycled via a hardware button
-- **Live weather data** from WeatherAPI.com — current conditions, 3-day forecast, 6-hour hourly breakdown, air quality
-- **Indoor environment** — temperature and humidity from an SHTC3 sensor with 6-hour history graphs
-- **Astronomy data** — sunrise/sunset, moon phase, lunar orbit diagram, sun arc, and seasons orbit
-- **DSEG7 digital clock** on the dashboard page, driven by PCF85063A RTC with periodic NTP sync
-- **Battery voltage monitoring** via ADC
-- **Pixel-accurate browser preview** (`preview.html`) for layout verification before flashing — no guesswork
+- Target hardware: Waveshare ESP32-S3-RLCD-4.2
+- Application framework: Arduino-ESP32
+- Reference build date: 2026-07-24
+- Reference core: Espressif Arduino-ESP32 3.3.11
+- Reference binary size: 1,288,475 bytes
+- Reference dynamic allocation: 50,088 bytes of global data
+- Display units: degrees Fahrenheit and miles per hour
+- Primary indoor sensor: Sensirion SEN66 at I2C address `0x6B`
 
-https://youtu.be/wd1mQkY0oWk
+The reference installation uses the board's 16 MB flash configuration with a 3 MB application partition and approximately 9.9 MB FATFS partition. This is flash allocation, not RAM allocation. Waveshare specifies 8 MB PSRAM and 16 MB flash for the board.
 
+## Functional scope
 
----
+### Indoor measurements
 
-## 📟 Display Pages
+The firmware reads the complete processed SEN66 measurement frame:
 
-| Page | Name | Description |
-|------|------|-------------|
-| 0 | **Dashboard** | Live DSEG7 clock, indoor temp & humidity, date, battery, Wi-Fi status |
-| 1 | **Current Conditions** | Outdoor temp, feels like, condition, high/low, UV, wind, air quality, rainfall |
-| 2 | **Hourly Forecast** | 6-hour grid — temp, rain chance, rainfall, UV and wind per hour |
-| 3 | **3-Day Forecast** | Three day cards with high/low, condition, rain amount and rain chance |
-| 4 | **Astronomy** | Sunrise/sunset times, day length, solar noon, moon phase, illumination, next phase |
-| 5 | **Lunar Orbit** | Orbit diagram with phase markers, cycle progress arc, illumination %, age, days to next phase |
-| 6 | **Sun Arc** | Sun position arc with current position, day length, solar noon, sunrise/sunset countdown |
-| 7 | **Seasons (Classic)** | Clean ellipse orbit with Earth position, season names in corners, EQU/SOL labels and dates |
-| 8 | **Seasons (Orbit)** | NOAA-inspired filled quadrant diagram with bullseye markers, flashing Earth dot, progress arc, corner countdowns |
-| 9 | **Temp Graph** | 6-hour indoor temperature history with min/max markers, trend arrow, stats bar |
-| 10 | **Humidity Graph** | 6-hour indoor humidity history with min/max markers, trend arrow, stats bar |
-| 11 | **System Info** | Wi-Fi signal, IP address, weather refresh timer, uptime, NTP sync status, sensor health |
+- PM1.0
+- PM2.5
+- PM4.0
+- PM10
+- compensated relative humidity
+- compensated temperature
+- VOC Index
+- NOx Index
+- CO2
 
----
+Indoor particle AQI is calculated locally from the current PM2.5 and PM10 readings. It is a short-term instrument indication, not an official regulatory AQI report. See [Data processing and AQI](docs/DATA_PROCESSING.md).
 
-## 🔧 Hardware
+### LCD pages
 
-| Component | Detail |
-|-----------|--------|
-| MCU | ESP32-S3 |
-| Display | 400×300 px, 1-bit monochrome RLCD (landscape), SPI |
-| Temp/Humidity | SHTC3 sensor, I2C |
-| RTC | PCF85063A, I2C |
-| Buttons | BTN_LEFT (GPIO 0) — next page · BTN_MIDDLE (GPIO 18) — refresh weather |
-| Battery ADC | GPIO 4 |
+| Page | Display |
+|---:|---|
+| 0 | Indoor Air: temperature, humidity, CO2, VOC, indoor AQI, outdoor AQI, sunrise, sunset, SEN66 state, battery, and Wi-Fi |
+| 1 | Analog Clock |
+| 2 | North American Time Zones |
+| 3 | Outdoor Conditions |
+| 4 | Next Six Forecast Hours |
+| 5 | Three-Day Forecast |
+| 6 | Northern Hemisphere Seasons |
+| 7 | Season Orbit |
+| 8 | Temperature History |
+| 9 | Humidity History |
+| 10 | System Information |
+| 11 | Complete SEN66 Output |
+| 12 | Timers, Stopwatch, and Alarms |
 
-This project was developed on the **Waveshare ESP32-S3 RLCD 4.2"** development board. Refer to the Waveshare documentation for pinout and wiring details.
-https://docs.waveshare.com/ESP32-S3-RLCD-4.2
+The web interface stores a page-inclusion mask in NVS. Unchecked pages are skipped by both hardware-button navigation and automatic cycling. A page can still be selected directly from the web interface for inspection.
 
----
+### Web interface
 
-## 🗂️ Project Files
+The ESP32 serves an unauthenticated HTTP interface on its LAN address. Available controls include:
 
-| File | Description |
-|------|-------------|
-| `main.cpp` | Full firmware source — all 12 pages, helper functions, WiFi/NTP/sensor/weather logic |
-| `secrets.h` | Credentials template — WiFi SSID/password, WeatherAPI key, location (**keep out of version control**) |
-| `preview.html` | Pixel-accurate browser preview using embedded Adafruit GFX bitmap font data |
-| `display_bsp.cpp / .h` | Low-level RLCD display driver (GFXcanvas1 → pushCanvasToRLCD) |
-| `font.h` | DSEG7 Classic Bold 84pt (dashboard clock) |
-| `secfont.h` | DSEG7 Classic Bold 36pt (dashboard seconds) |
-| `FreeSans9pt7b.h` | Adafruit GFX bitmap font — 9pt |
-| `FreeSans12pt7b.h` | Adafruit GFX bitmap font — 12pt |
+- immediate WeatherAPI refresh
+- immediate NTP synchronization
+- weather location replacement using decimal `latitude,longitude`
+- automatic LCD page cycling and dwell time
+- per-page navigation inclusion
+- page-change audio enable/disable
+- alarm and timer audio enable/disable
+- direct LCD page selection
+- current-display screenshot as a one-bit BMP
+- countdown timer, stopwatch, and three persistent alarms
 
-> ⚠️ `secrets.h` contains your credentials. It is included in `.gitignore` by default — **never commit it to a public repository.**
+The interface is intended for a trusted local network. It does not implement TLS, user authentication, or authorization. See [Security](SECURITY.md).
 
----
+## Hardware connection
 
-## 🚀 Getting Started
+The SEN66 is connected to the board's external I2C header:
 
-### 1. Arduino IDE Setup
+| Signal | ESP32-S3 pin | SEN66 connection |
+|---|---:|---|
+| SDA | GPIO 13 | SDA |
+| SCL | GPIO 14 | SCL |
+| Supply | Per SEN66 module requirements | VDD |
+| Ground | GND | GND |
 
-Before flashing, set up the Arduino IDE for the ESP32-S3 and Waveshare board by following the official guides:
+Do not infer supply voltage from the I2C logic level. Confirm the exact SEN66 carrier/module power-input requirements before energizing the assembly. The firmware assumes the physical connection has already been verified.
 
-- [Waveshare ESP32-S3 RLCD 4.2" Development Environment Setup](https://docs.waveshare.com/ESP32-S3-RLCD-4.2/Development-Environment-Setup-Arduino)
-- [Waveshare Arduino IDE Setup Guide](https://docs.waveshare.com/ESP32-Arduino-Tutorials/Arduino-IDE-Setup)
+Additional board assignments used by the firmware are documented in [Hardware integration](docs/HARDWARE.md).
 
-### 2. Required Libraries
+## Software prerequisites
 
-Install the following libraries via the Arduino Library Manager:
+Install the following through Arduino IDE Board Manager and Library Manager:
 
-| Library | Purpose |
-|---------|---------|
-| **Adafruit GFX Library** | Drawing primitives and bitmap font rendering |
-| **PCF85063A-Soldered** | RTC hardware driver |
-| **ArduinoJson** *(optional)* | Not required — a custom JSON parser is used |
+| Component | Reference version | Purpose |
+|---|---:|---|
+| Espressif ESP32 Arduino core | 3.3.11 | ESP32-S3 runtime, Wi-Fi, HTTP, NVS, I2S, and ESP-IDF display interfaces |
+| Adafruit GFX Library | 1.12.6 | One-bit canvas and graphics primitives |
+| Sensirion I2C SEN66 | 1.3.1 | SEN66 command and measurement driver |
+| Sensirion Core | 0.7.3 | Sensirion I2C framing, CRC, and error support |
+| Soldered PCF85063A RTC Arduino Library | 1.0.0 | PCF85063A RTC access |
 
-> ESP32-S3 board support is installed via the Espressif Arduino core as part of the Waveshare setup guides above.
+The audio implementation uses the Arduino-ESP32 3.x `ESP_I2S` API and will not compile unchanged against older 2.x cores.
 
-### 3. Configure Credentials
+## Configuration
 
-Copy `secrets.h` into your project folder and fill in your details:
+1. Copy `firmware/weather_dash/secrets.example.h` to `firmware/weather_dash/secrets.h`.
+2. Replace every placeholder.
+3. Do not commit `secrets.h`.
 
 ```cpp
-#define WIFI_SSID      "your_wifi_network"
-#define WIFI_PASSWORD  "your_wifi_password"
-#define WEATHER_API_KEY "your_weatherapi_key"
-#define WEATHER_LOCATION "your_city_or_coordinates"
+#pragma once
+
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+const char* weatherApiKey = "YOUR_WEATHERAPI_KEY";
+const char* weatherLocation = "YOUR_CITY_OR_LAT_LON";
 ```
 
-### 4. Weather API
+`weatherLocation` is the first-boot default. A valid location entered through the web interface is stored in the ESP32 `Preferences` namespace and takes precedence on subsequent boots. The credentials file is never rewritten by the firmware.
 
-Weather data is fetched from [WeatherAPI.com](https://www.weatherapi.com/).
+## Build and upload
 
-- Create a **free account** at weatherapi.com
-- Copy your API key into `secrets.h`
-- The free tier supports current conditions, forecast, hourly, astronomy, and air quality in a single HTTPS call — no paid plan required for this project
+1. Open `firmware/weather_dash/weather_dash.ino` in Arduino IDE.
+2. Select an ESP32-S3 target compatible with the Waveshare board.
+3. Select 16 MB flash.
+4. Select the partition layout with a 3 MB application partition and approximately 9.9 MB FATFS.
+5. Enable the board's PSRAM option appropriate to the installed ESP32-S3 module.
+6. Compile before connecting the battery-powered installation.
+7. Upload over USB and open Serial Monitor at 115200 baud.
 
-### 5. Flash the Board
+The display driver allocates its frame buffer and lookup tables in PSRAM. A build can compile successfully yet fail at runtime if PSRAM is unavailable or configured incorrectly.
 
-Open `main.cpp` in Arduino IDE, select the correct board and port, and upload. The display will initialise, connect to Wi-Fi, sync the RTC via NTP, and fetch weather data on first boot.
+## Runtime intervals
 
----
+| Operation | Interval |
+|---|---:|
+| SEN66 measurement read | 1 second |
+| Battery ADC read | 10 seconds |
+| Temperature/humidity history sample | 15 minutes |
+| History capacity | 24 samples / 6 hours |
+| WeatherAPI refresh | 30 minutes |
+| NTP synchronization | 24 hours |
+| LCD auto-cycle dwell | 3 to 300 seconds, configurable |
 
-## 🌐 Data & Timing
+## Documentation index
 
-- Weather data refreshes every **30 minutes** automatically, or on demand via BTN_MIDDLE
-- NTP time sync occurs on boot and every **24 hours**
-- Indoor sensor history is sampled every **15 minutes**, storing a 6-hour rolling buffer (24 samples)
-- **Southern Hemisphere seasons** are used throughout (Summer = Dec–Mar, Winter = Jun–Sep)
+- [System architecture](docs/ARCHITECTURE.md)
+- [Hardware integration](docs/HARDWARE.md)
+- [Data processing and AQI](docs/DATA_PROCESSING.md)
+- [Web interface and persistence](docs/WEB_INTERFACE.md)
+- [Build, commissioning, and maintenance](docs/OPERATIONS.md)
+- [Source provenance and third-party attribution](ATTRIBUTION.md)
+- [Security model](SECURITY.md)
 
----
+## Provenance and licensing
 
-## 🖥️ Browser Preview
+This repository is a renamed GitHub fork of [JohnWillieGee/Waveshare-RLCD-ESP32S3-Weather-dashboard](https://github.com/JohnWillieGee/Waveshare-RLCD-ESP32S3-Weather-dashboard), which supplied the immediate dashboard and display-driver baseline. That repository, at audited commit `01dfda32398427422586dd58fd0441e5796cb510`, does not contain the `LICENSE` file referenced by its README and GitHub reports no detected license.
 
-`preview.html` is a pixel-accurate browser-based preview of the display output. It uses the embedded Adafruit GFX bitmap font data to render text identically to the hardware. Open it in any modern browser to check layout changes before flashing.
+An earlier acknowledged source, [juanjocastillo/Waveshare-RLCD-ESP32S3-Dashboard-v12_1](https://github.com/juanjocastillo/Waveshare-RLCD-ESP32S3-Dashboard-v12_1), is MIT-licensed and is the apparent source of the low-level RLCD driver and several font assets.
 
----
+No project-wide open-source license is asserted here because the immediate upstream contribution has no explicit license grant. Third-party components retain their own licenses. Refer to [ATTRIBUTION.md](ATTRIBUTION.md) before copying, redistributing, or relicensing any portion of this repository.
 
-## 🔮 Potential Future Enhancements
+## Safety and interpretation
 
-- Bluetooth or web interface for configuration (location, timezone, units)
-- Alerts for severe weather conditions
-- Additional sensor support (pressure, CO2, PM2.5)
-- OTA firmware updates over Wi-Fi
-- SD card logging for extended sensor history
-- Portrait orientation variant
-
----
-
-## 📄 License
-
-This project is open source. See [LICENSE](LICENSE) for details.
-
----
-
-## 🙏 Acknowledgements
-
-- [Waveshare](https://www.waveshare.com/) for the ESP32-S3 RLCD hardware and documentation
-- [Adafruit GFX Library](https://github.com/adafruit/Adafruit-GFX-Library) for the display rendering framework
-- [WeatherAPI.com](https://www.weatherapi.com/) for the weather data API
-- [DSEG Font](https://www.keshikan.net/fonts-e.html) for the digital clock typeface
-- https://github.com/juanjocastillo/Waveshare-RLCD-ESP32S3-Dashboard-v12_1
+- This is not a calibrated regulatory monitor.
+- Current PM-derived AQI is not equivalent to the prescribed 24-hour AQI reporting process.
+- VOC Index and NOx Index are dimensionless processed indicators, not gas concentrations.
+- CO2, VOC, and NOx outputs require sensor startup and conditioning time.
+- Battery voltage thresholds are approximate and are not a fuel-gauge algorithm.
+- The web interface must not be exposed directly to the public internet.

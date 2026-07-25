@@ -1,3 +1,11 @@
+/*
+ * RLCD display-port implementation inherited through:
+ *   juanjocastillo/Waveshare-RLCD-ESP32S3-Dashboard-v12_1 (MIT)
+ *   JohnWillieGee/Waveshare-RLCD-ESP32S3-Weather-dashboard
+ *
+ * See ATTRIBUTION.md and licenses/Juanjo-Castillo-MIT.txt.
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include <freertos/FreeRTOS.h>
