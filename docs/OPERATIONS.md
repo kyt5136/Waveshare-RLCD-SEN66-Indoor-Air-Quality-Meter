@@ -49,8 +49,8 @@ Observe Serial Monitor at 115200 baud. Expected milestones:
 ESP32-S3 SEN66 WEATHER STATION
 SEN66 started
 WiFi connected
-RTC synced
 Outdoor weather loaded
+Location clock synced
 ```
 
 Exact wording may vary with state. Do not proceed directly to enclosure closure if the SEN66 probe, serial-number read, or continuous-measurement command fails.
@@ -65,10 +65,13 @@ Verify:
 4. Hourly forecast begins with the next full hour and contains six entries across midnight.
 5. Sunrise and sunset correspond to the configured WeatherAPI location.
 6. RTC survives a normal reset.
-7. Web location validation rejects out-of-range coordinates.
-8. Page-mask changes survive reset.
-9. Navigation audio and alarm audio operate independently.
-10. `secrets.h` remains untracked.
+7. The displayed IANA timezone and UTC offset match the configured coordinates.
+8. Changing latitude/longitude through the web interface updates weather,
+   timezone, RTC date, and local clock without rebuilding.
+9. Web location validation rejects out-of-range coordinates.
+10. Page-mask changes survive reset.
+11. Navigation audio and alarm audio operate independently.
+12. `secrets.h` remains untracked.
 
 ### Forced CO2 calibration
 
@@ -122,9 +125,15 @@ Install Arduino-ESP32 3.x. The application is not source-compatible with the old
 
 Confirm PSRAM is enabled and detected. The RLCD driver asserts if its PSRAM allocations fail.
 
-### Weather location changes but displayed time zone does not
+### Weather location changes but displayed timezone does not
 
-This is expected. Weather location and POSIX time zone are independent. Modify `posixTZ` and rebuild for a different local time zone.
+- confirm the location update produced a successful WeatherAPI response;
+- confirm `tz_id`, `localtime_epoch`, and `localtime` are present in the response;
+- inspect Serial Monitor for the `[TIME]` resolution line;
+- confirm the device can reach NTP after the WeatherAPI response;
+- reload the web page after the weather request completes.
+
+The prior timezone remains active when a new location cannot be resolved.
 
 ### Web interface unavailable
 

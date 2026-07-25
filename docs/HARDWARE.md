@@ -67,15 +67,14 @@ The board display is a fragile structural element. Follow Waveshare's handling w
 
 ## 5. RTC
 
-The PCF85063A is accessed through the shared I2C bus. NTP sets both the ESP32 system clock and RTC. The RTC is then used for display time and alarms.
+The PCF85063A is accessed through the shared I2C bus. NTP supplies absolute UTC
+time. WeatherAPI resolves the active coordinates to an IANA timezone,
+location-local calendar time, and current UTC offset. The firmware applies that
+offset before writing the RTC, which is then used for display time and alarms.
 
-The compiled POSIX time-zone rule defaults to U.S./Canadian Eastern time:
-
-```text
-EST5EDT,M3.2.0,M11.1.0
-```
-
-Weather location changes do not modify this rule. A deployment outside Eastern time must change `posixTZ` and rebuild.
+The last resolved timezone and offset are retained in NVS. A successful weather
+update recalculates them, including after a web latitude/longitude change and
+across DST transitions. No compiled geographic timezone selection is required.
 
 ## 6. Audio
 
@@ -109,4 +108,3 @@ For long-duration battery operation, a future revision should:
 - use RTC wake;
 - disable the codec and amplifier outside audio events;
 - characterize actual current at the cell, not only nominal subsystem figures.
-

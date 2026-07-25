@@ -1,7 +1,12 @@
 # Change Log
 
-## Outdoor CO2 calibration workflow - 2026-07-25
+## Dynamic location time and outdoor CO2 calibration - 2026-07-25
 
+- Replaced the compiled Eastern POSIX timezone with coordinate-derived timezone
+  and local-time resolution from WeatherAPI.
+- Added automatic RTC, current UTC-offset, and IANA timezone updates after
+  first-boot default coordinates or web location changes.
+- Added NVS retention of the last resolved timezone for offline restarts.
 - Added a guarded forced-CO2 recalibration control to the main web page.
 - Added a mandatory fresh WeatherAPI pressure download and SEN66 ambient-pressure compensation.
 - Added a five-minute continuous 350-450 ppm outdoor qualification window.

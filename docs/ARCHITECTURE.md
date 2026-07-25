@@ -36,8 +36,8 @@ The implemented startup sequence is:
 7. reset the SEN66, read its serial number, and start continuous measurement;
 8. connect to the configured 2.4 GHz Wi-Fi network;
 9. start the embedded HTTP server;
-10. synchronize system time and RTC from NTP;
-11. retrieve WeatherAPI forecast data;
+10. retrieve WeatherAPI data and resolve the location timezone/local time;
+11. synchronize UTC from NTP and write location-local time to the RTC;
 12. acquire the first SEN66 measurement;
 13. initialize history buffers, battery state, and audio indications.
 
@@ -68,7 +68,10 @@ Legacy scalar variables `temperature` and `humidity` mirror the latest SEN66 val
 
 ### Outdoor state
 
-`WeatherData weatherData` stores current conditions, outdoor PM2.5/AQI, three forecast days, sunrise/sunset, update time, and validity. `HourlyData hourlyData` stores six forecast records.
+`WeatherData weatherData` stores current conditions, outdoor PM2.5/AQI, three
+forecast days, sunrise/sunset, pressure, update time, and validity.
+`HourlyData hourlyData` stores six forecast records. The WeatherAPI location
+object also updates the active IANA timezone, current UTC offset, and RTC.
 
 The WeatherAPI response is reduced immediately; the original JSON body is not retained after parsing.
 
@@ -105,7 +108,7 @@ Alarm and timer events can force the Timers page regardless of its navigation-ma
 | SEN66 missing at `0x6B` | indoor data remains invalid; system continues |
 | SEN66 read error | error count increments; last valid display state remains |
 | Wi-Fi unavailable | indoor functions remain operational; web and remote weather unavailable |
-| WeatherAPI HTTP or parsing failure | current remote state is not marked successfully refreshed |
+| WeatherAPI HTTP or parsing failure | current remote state is not marked successfully refreshed; last resolved timezone remains active |
 | NTP unavailable | RTC remains the local time source |
 | PSRAM allocation failure | driver assertion can halt startup |
 | Invalid web location | HTTP 400; previous location is retained |
@@ -116,6 +119,8 @@ Alarm and timer events can force the Timers page regardless of its navigation-ma
 - Weather JSON parsing is positional string parsing, not a general JSON parser. WeatherAPI field-order or schema changes can break extraction.
 - HTTP is unauthenticated and must remain on a trusted LAN.
 - The code is sized for the 3 MB application partition. The generic 1.25 MB Arduino partition is close to capacity and is not the intended deployment configuration.
-- Time-zone behavior is compiled through the POSIX `posixTZ` string. Changing weather coordinates does not automatically change the device time zone.
+- Timezone and current UTC offset are resolved from WeatherAPI for the active
+  coordinates. The offset is refreshed every 30 minutes while online, including
+  across DST changes, and the last resolved value is retained in NVS for
+  offline reboot behavior.
 - SEN66 sampling runs continuously; the current firmware is optimized for a powered desktop station rather than maximum battery endurance.
-

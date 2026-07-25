@@ -135,7 +135,33 @@ Outdoor PM2.5 AQI is recalculated locally through the same PM2.5 interpolation r
 
 API schema reference: [WeatherAPI documentation](https://www.weatherapi.com/docs/).
 
-## 7. Pressure-assisted forced CO2 recalibration
+## 7. Coordinate-derived timezone and local clock
+
+The same Forecast API response used for weather provides:
+
+- `location.tz_id`;
+- `location.localtime_epoch`;
+- `location.localtime`.
+
+The firmware interprets the local calendar fields against the returned epoch to
+derive the current UTC offset, including the offset currently produced by DST.
+It supports whole-hour, half-hour, and quarter-hour civil offsets. A fixed
+POSIX environment string is generated for the resolved current offset, NTP
+supplies absolute UTC time, and the location-local result is written to the
+PCF85063A RTC.
+
+The IANA timezone and offset are stored in NVS only when they change. Every
+successful 30-minute WeatherAPI update recalculates the offset, so an online
+station follows DST transitions without a firmware rebuild. During an offline
+reboot, the most recently resolved offset is used until weather service
+connectivity returns.
+
+Changing latitude/longitude through the web interface invalidates the prior
+weather data and schedules a new request. A successful request updates weather,
+timezone, and RTC together. The API-provided sunrise and sunset strings are
+already local to the same resolved location.
+
+## 8. Pressure-assisted forced CO2 recalibration
 
 The web calibration workflow parses WeatherAPI `current.pressure_mb`, validates
 700-1200 hPa, rounds it to an integer hPa, and sends it through
@@ -159,13 +185,13 @@ qualification because pressure changes the CO2 measurement. The system cannot
 independently verify outdoor placement or establish a traceable reference-gas
 concentration.
 
-## 8. Hourly selection
+## 9. Hourly selection
 
 The parser scans up to 72 hourly records across the three forecast days. It selects the first six records with `time_epoch` later than the current system epoch. This allows the list to cross midnight rather than restarting at 00:00 or stopping at the end of the first forecast day.
 
 System time is preferred. WeatherAPI `localtime_epoch` is used as a fallback if system time is not valid.
 
-## 9. History buffers
+## 10. History buffers
 
 Temperature and humidity histories contain 24 entries sampled every 15 minutes. At capacity, each graph represents six hours. History is RAM-resident and is reset at boot.
 

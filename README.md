@@ -8,10 +8,10 @@ The SEN66 is the authoritative source for indoor temperature, relative humidity,
 
 - Target hardware: Waveshare ESP32-S3-RLCD-4.2
 - Application framework: Arduino-ESP32
-- Reference build date: 2026-07-24
+- Reference build date: 2026-07-25
 - Reference core: Espressif Arduino-ESP32 3.3.11
-- Reference binary size: 1,288,475 bytes
-- Reference dynamic allocation: 50,088 bytes of global data
+- Reference binary size: 1,308,235 bytes
+- Reference dynamic allocation: 50,320 bytes of global data
 - Display units: degrees Fahrenheit and miles per hour
 - Primary indoor sensor: Sensirion SEN66 at I2C address `0x6B`
 
@@ -117,7 +117,12 @@ const char* weatherApiKey = "YOUR_WEATHERAPI_KEY";
 const char* weatherLocation = "YOUR_CITY_OR_LAT_LON";
 ```
 
-`weatherLocation` is the first-boot default. A valid location entered through the web interface is stored in the ESP32 `Preferences` namespace and takes precedence on subsequent boots. The credentials file is never rewritten by the firmware.
+`weatherLocation` is the first-boot default. A valid location entered through
+the web interface is stored in the ESP32 `Preferences` namespace and takes
+precedence on subsequent boots. Each successful WeatherAPI response resolves
+the coordinates to an IANA timezone, location-local time, and current UTC
+offset. The RTC and clock pages follow that resolved location automatically.
+The credentials file is never rewritten by the firmware.
 
 ## Build and upload
 

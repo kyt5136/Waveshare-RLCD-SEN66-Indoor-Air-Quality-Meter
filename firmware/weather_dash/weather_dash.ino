@@ -47,13 +47,12 @@ struct SeasonInfo;
 
 const char* ntpServer          = "us.pool.ntp.org";
 
-// North American Eastern time. The POSIX rule applies U.S./Canadian DST.
-// Use CST6CDT, MST7MDT, PST8PDT, or MST7 for other North American zones.
-const char* posixTZ = "EST5EDT,M3.2.0,M11.1.0";
-
-// gmtOffset_sec is now computed at runtime from the system clock after NTP sync.
-// It reflects the current UTC offset including DST. Do NOT hardcode this.
-long gmtOffset_sec = -18000;  // default EST; overwritten after NTP sync
+// Resolved from the WeatherAPI location object for activeWeatherLocation.
+// A fixed current offset is refreshed with weather data, including after a
+// location change. This avoids a compiled-in geographic timezone.
+char activeTimezoneId[48] = "UTC";
+char activePosixTZ[24] = "UTC0";
+long gmtOffset_sec = 0;
 
 const int BTN_LEFT    = 0;
 const int BTN_MIDDLE  = 18;
@@ -643,17 +642,85 @@ void serviceAlarmChimes() {
 }
 
 // ===== TZ LABEL HELPER =====
+int64_t daysFromCivil(int year, unsigned month, unsigned day) {
+  year -= month <= 2;
+  const int era = (year >= 0 ? year : year - 399) / 400;
+  const unsigned yoe = (unsigned)(year - era * 400);
+  const unsigned doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 +
+                       day - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097LL + (int64_t)doe - 719468LL;
+}
+
+void configureFixedOffsetTimezone(long offsetSeconds) {
+  long totalMinutes = offsetSeconds / 60;
+  long magnitude = labs(totalMinutes);
+  long hours = magnitude / 60;
+  long minutes = magnitude % 60;
+  // POSIX TZ signs are reversed: UTC5 means UTC-05:00.
+  if (minutes == 0) {
+    snprintf(activePosixTZ, sizeof(activePosixTZ), "UTC%s%ld",
+             totalMinutes > 0 ? "-" : "", hours);
+  } else {
+    snprintf(activePosixTZ, sizeof(activePosixTZ), "UTC%s%ld:%02ld",
+             totalMinutes > 0 ? "-" : "", hours, minutes);
+  }
+  setenv("TZ", activePosixTZ, 1);
+  tzset();
+}
+
+bool applyWeatherLocationTime(const String& timezoneId,
+                              const String& localTimeText,
+                              time_t localEpoch) {
+  int year, month, day, hour, minute;
+  if (timezoneId.length() == 0 || localEpoch < 1000000000 ||
+      sscanf(localTimeText.c_str(), "%d-%d-%d %d:%d",
+             &year, &month, &day, &hour, &minute) != 5) {
+    return false;
+  }
+  if (month < 1 || month > 12 || day < 1 || day > 31 ||
+      hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    return false;
+  }
+
+  int64_t localAsUtc = daysFromCivil(year, (unsigned)month, (unsigned)day) *
+                       86400LL + hour * 3600LL + minute * 60LL +
+                       (localEpoch % 60);
+  int64_t offset = localAsUtc - (int64_t)localEpoch;
+  // Round to a whole minute and allow every civil offset from UTC-14 to UTC+14.
+  offset = offset >= 0 ? ((offset + 30) / 60) * 60 :
+                         ((offset - 30) / 60) * 60;
+  if (offset < -14 * 3600LL || offset > 14 * 3600LL) return false;
+
+  bool changed = gmtOffset_sec != (long)offset ||
+                 timezoneId != String(activeTimezoneId);
+  gmtOffset_sec = (long)offset;
+  timezoneId.toCharArray(activeTimezoneId, sizeof(activeTimezoneId));
+  configureFixedOffsetTimezone(gmtOffset_sec);
+
+  int weekday = (int)((daysFromCivil(year, (unsigned)month, (unsigned)day) + 4) % 7);
+  if (weekday < 0) weekday += 7;
+  rtc.setTime(hour, minute, (int)(localEpoch % 60));
+  rtc.setDate(weekday, day, month, year);
+
+  if (changed) {
+    prefs.begin("dash", false);
+    prefs.putString("tz_id", activeTimezoneId);
+    prefs.putLong("tz_off", gmtOffset_sec);
+    prefs.end();
+  }
+  Serial.printf("[TIME] %s, UTC%+ld:%02ld, local %s\n",
+                activeTimezoneId, gmtOffset_sec / 3600,
+                labs((gmtOffset_sec / 60) % 60), localTimeText.c_str());
+  return true;
+}
+
 const char* getTZLabel() {
-  time_t now = time(nullptr);
-  struct tm* ti = localtime(&now);
-  bool dst = (ti && ti->tm_isdst > 0);
-  if (gmtOffset_sec == -14400) return "EDT";
-  if (gmtOffset_sec == -18000) return dst ? "CDT" : "EST";
-  if (gmtOffset_sec == -21600) return dst ? "MDT" : "CST";
-  if (gmtOffset_sec == -25200) return dst ? "PDT" : "MST";
-  if (gmtOffset_sec == -28800) return "PST";
-  if (gmtOffset_sec == 0) return "UTC";
-  return "LOCAL";
+  static char label[12];
+  long totalMinutes = gmtOffset_sec / 60;
+  snprintf(label, sizeof(label), "UTC%+ld:%02ld",
+           totalMinutes / 60, labs(totalMinutes % 60));
+  return label;
 }
 
 // ===== CENTERED TEXT HELPER =====
@@ -967,6 +1034,15 @@ bool fetchWeatherData() {
   int curPos   = payload.indexOf("\"current\":");
   int fcastPos = payload.indexOf("\"forecast\":");
 
+  int locPos = payload.indexOf("\"location\":");
+  String resolvedTimezone = pstr("\"tz_id\":\"", locPos);
+  String resolvedLocalTime = pstr("\"localtime\":\"", locPos);
+  time_t resolvedLocalEpoch =
+    (time_t)pint("\"localtime_epoch\":", locPos, curPos);
+  if (!applyWeatherLocationTime(resolvedTimezone, resolvedLocalTime,
+                                resolvedLocalEpoch)) {
+    Serial.println("[TIME] Weather location did not provide a valid timezone/local time.");
+  }
 
   weatherData.currentTemp = pfloat("\"temp_c\":",      curPos, fcastPos);
   weatherData.feelsLike   = pfloat("\"feelslike_c\":", curPos, fcastPos);
@@ -1318,8 +1394,20 @@ void drawTimeZonePage() {
   printCentered(&FONT_SMALL, 24, "NORTH AMERICAN TIME ZONES");
 
   time_t utcNow = time(nullptr);
-  struct tm* localInfo = localtime(&utcNow);
-  bool dst = localInfo && localInfo->tm_isdst > 0;
+  struct tm utcInfo;
+  gmtime_r(&utcNow, &utcInfo);
+  int year = utcInfo.tm_year + 1900;
+  auto firstSunday = [&](int month) {
+    int weekday = (int)((daysFromCivil(year, (unsigned)month, 1) + 4) % 7);
+    if (weekday < 0) weekday += 7;
+    return 1 + ((7 - weekday) % 7);
+  };
+  int secondSundayMarch = firstSunday(3) + 7;
+  int firstSundayNovember = firstSunday(11);
+  int month = utcInfo.tm_mon + 1;
+  bool dst = month > 3 && month < 11;
+  if (month == 3) dst = utcInfo.tm_mday >= secondSundayMarch;
+  if (month == 11) dst = utcInfo.tm_mday < firstSundayNovember;
   struct Zone { const char* city; const char* abbr; int offsetMinutes; };
   Zone zones[] = {
     {"New York",    dst ? "EDT" : "EST", dst ? -4*60 : -5*60},
@@ -2291,38 +2379,22 @@ void connectWiFi() {
 
 void syncRTCWithNTP() {
   if (!wifiConnected) return;
-  // Use POSIX TZ string — ESP32 handles DST transitions automatically.
-  // Pass 0,0 for gmtOffset/daylightOffset; the TZ string contains all the rules.
+  // NTP supplies UTC. The current coordinate-derived fixed offset converts it
+  // to location-local time before the RTC is updated.
   configTime(0, 0, ntpServer);
-  setenv("TZ", posixTZ, 1);
+  setenv("TZ", activePosixTZ, 1);
   tzset();
 
   struct tm timeinfo; int retries = 0;
   while (!getLocalTime(&timeinfo) && retries < 10) { delay(500); retries++; }
   if (getLocalTime(&timeinfo)) {
-    // Push correct local time (already DST-adjusted by the TZ rule) to RTC
+    // Push current location-local time to the hardware RTC.
     rtc.setTime(timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
     rtc.setDate(timeinfo.tm_wday, timeinfo.tm_mday, timeinfo.tm_mon+1, timeinfo.tm_year+1900);
     ntpLastSync = millis();
 
-    // Derive current UTC offset by comparing local epoch to UTC directly.
-    // Use gmtime_r to get UTC fields, then compute the difference in minutes
-    // by comparing hours/minutes — avoids mktime() double-conversion issue on newlib.
-    time_t localEpoch = time(nullptr);
-    struct tm utcCheck;
-    gmtime_r(&localEpoch, &utcCheck);
-    int localMinutes = timeinfo.tm_hour * 60 + timeinfo.tm_min;
-    int utcMinutes   = utcCheck.tm_hour  * 60 + utcCheck.tm_min;
-    int diffMins     = localMinutes - utcMinutes;
-    // Handle day boundary wrap
-    if (diffMins >  720) diffMins -= 1440;
-    if (diffMins < -720) diffMins += 1440;
-    gmtOffset_sec = (long)(diffMins * 60);
-
-    Serial.print("RTC synced! UTC offset: ");
-    Serial.print(gmtOffset_sec / 3600);
-    Serial.print("h, DST: ");
-    Serial.println(timeinfo.tm_isdst ? "YES" : "NO");
+    Serial.printf("RTC synced for %s (%s)\n",
+                  activeTimezoneId, getTZLabel());
   } else Serial.println("NTP failed");
 }
 
@@ -2373,6 +2445,9 @@ void nvsLoad() {
   sleepToHour   = prefs.getInt ("sleep_to",   6);
   String savedWeatherLocation = prefs.getString("weather_loc", weatherLocation);
   savedWeatherLocation.toCharArray(activeWeatherLocation, sizeof(activeWeatherLocation));
+  String savedTimezoneId = prefs.getString("tz_id", "UTC");
+  savedTimezoneId.toCharArray(activeTimezoneId, sizeof(activeTimezoneId));
+  gmtOffset_sec = prefs.getLong("tz_off", 0);
   // Alarms — defaults: disabled, 07:00, one-shot, blank label
   for (int i = 0; i < ALARM_COUNT; i++) {
     char k[16];
@@ -2398,6 +2473,7 @@ void nvsLoad() {
   swState.elapsed = 0;
   swState.startMs = 0;
   prefs.end();
+  configureFixedOffsetTimezone(gmtOffset_sec);
 }
 
 // Minimal CSS shared across all pages
@@ -2600,7 +2676,10 @@ void handleRoot() {
     "<div class='row' style='margin-top:10px'>"
     "<input type='text' id='weather_location' maxlength='63' value='" + String(activeWeatherLocation) + "'>"
     "<button class='btn' onclick='setWeatherLocation()'>Update Location</button></div>"
-    "<div id='weather_location_status' class='k'></div></div>"
+    "<div class='row' style='margin-top:10px'>" +
+    metric("Resolved timezone", String(activeTimezoneId)) +
+    metric("Current UTC offset", String(getTZLabel())) +
+    "</div><div id='weather_location_status' class='k'></div></div>"
     "<div class='card'><h2>Navigation Audio</h2>"
     "<div class='sw'><span class='swlbl'>Sound beeps when changing LCD pages</span>"
     "<label class='switch'><input type='checkbox' id='navigation_audio'" +
@@ -3475,10 +3554,10 @@ void setup() {
 
   if (wifiConnected) {
     startWebServer();
-    drawBoot("Syncing clock...", 0); syncRTCWithNTP();
-    bootLine--; drawBoot("Clock sync complete", 1);
     drawBoot("Loading outdoor weather...", 0); fetchWeatherData();
     bootLine--; drawBoot(weatherData.valid ? "Outdoor weather loaded" : "Weather unavailable", weatherData.valid ? 1 : -1);
+    drawBoot("Syncing location time...", 0); syncRTCWithNTP();
+    bootLine--; drawBoot("Location clock synced", 1);
   }
 
   if (senReady) {

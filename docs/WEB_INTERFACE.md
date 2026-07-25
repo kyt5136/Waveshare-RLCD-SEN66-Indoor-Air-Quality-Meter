@@ -60,7 +60,10 @@ Validation enforces:
 - longitude between -180 and +180;
 - maximum stored length.
 
-The stored value replaces the compiled `weatherLocation` default for future WeatherAPI requests. It does not change the Wi-Fi credentials, API key, POSIX time zone, or `secrets.h`.
+The stored value replaces the compiled `weatherLocation` default for future
+WeatherAPI requests. A successful response also updates the active IANA
+timezone, UTC offset, system timezone environment, and RTC. It does not change
+the Wi-Fi credentials, API key, or `secrets.h`.
 
 ## 5. SEN66 outdoor calibration control
 
@@ -99,6 +102,8 @@ Namespace: `dash`
 | `sleep_from` | int | sleep start hour |
 | `sleep_to` | int | wake hour |
 | `weather_loc` | string | active WeatherAPI latitude/longitude or location |
+| `tz_id` | string | last WeatherAPI-resolved IANA timezone |
+| `tz_off` | long | last current UTC offset in seconds |
 | `alN_h` | byte | alarm hour |
 | `alN_m` | byte | alarm minute |
 | `alN_lbl` | string | alarm label |
