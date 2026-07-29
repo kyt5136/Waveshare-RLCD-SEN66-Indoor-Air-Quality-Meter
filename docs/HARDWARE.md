@@ -4,13 +4,13 @@
 
 The target is the Waveshare ESP32-S3-RLCD-4.2. Manufacturer documentation identifies:
 
-- ESP32-S3 dual-core MCU;
-- 16 MB flash;
-- 8 MB PSRAM;
-- 300 x 400 fully reflective display, used here as 400 x 300 landscape;
-- PCF85063 RTC;
-- ES8311 audio codec, amplifier, and speaker path;
-- onboard 18650 holder and battery-management circuitry;
+- ESP32-S3 dual-core MCU.
+- 16 MB flash.
+- 8 MB PSRAM.
+- 300 x 400 fully reflective display, used here as 400 x 300 landscape.
+- PCF85063 RTC.
+- ES8311 audio codec, amplifier, and speaker path.
+- onboard 18650 holder and battery-management circuitry.
 - external I2C and GPIO expansion.
 
 Primary manufacturer reference: [Waveshare ESP32-S3-RLCD-4.2 documentation](https://docs.waveshare.com/ESP32-S3-RLCD-4.2).
@@ -26,8 +26,8 @@ Primary manufacturer reference: [Waveshare ESP32-S3-RLCD-4.2 documentation](http
 | RLCD reset | 41 | output |
 | External I2C SDA | 13 | bidirectional |
 | External I2C SCL | 14 | output/open-drain |
-| Left/KEY button | 0 | input with pull-up |
-| Middle/BOOT button | 18 | input with pull-up |
+| Previous page and Wi-Fi button | 0 | input with pull-up |
+| Next page button | 18 | input with pull-up |
 | Battery ADC | 4 | analog input |
 | Audio amplifier enable | 46 | output |
 | I2S BCLK | 9 | output |
@@ -67,15 +67,14 @@ The board display is a fragile structural element. Follow Waveshare's handling w
 
 ## 5. RTC
 
-The PCF85063A is accessed through the shared I2C bus. NTP sets both the ESP32 system clock and RTC. The RTC is then used for display time and alarms.
+The PCF85063A is accessed through the shared I2C bus. NTP supplies absolute UTC
+time. WeatherAPI resolves the active coordinates to an IANA timezone,
+location-local calendar time, and current UTC offset. The firmware applies that
+offset before writing the RTC, which is then used for display time and alarms.
 
-The compiled POSIX time-zone rule defaults to U.S./Canadian Eastern time:
-
-```text
-EST5EDT,M3.2.0,M11.1.0
-```
-
-Weather location changes do not modify this rule. A deployment outside Eastern time must change `posixTZ` and rebuild.
+The last resolved timezone and offset are retained in NVS. A successful weather
+update recalculates them, including after a web latitude/longitude change and
+across DST transitions. No compiled geographic timezone selection is required.
 
 ## 6. Audio
 
@@ -89,24 +88,26 @@ Navigation clicks and alarm/timer chimes have independent persistent enable flag
 
 ## 7. Battery measurement
 
-The battery estimate is calculated from GPIO 4:
+The schematic uses a 200 kΩ upper resistor and a 100 kΩ lower resistor. The battery divider ratio is 3.000.
+
+The firmware uses the calibrated Arduino ADC millivolt function. It averages 32 samples and removes two outliers.
 
 ```text
-Vbattery = ADCraw / 4095 x 3.3 x 3.0 x 1.079
+Vbattery = ADCmillivolts × 3.000 × BATTERY_CALIBRATION / 1000
 ```
 
-The factors represent the assumed divider and an empirical correction. This is not a calibrated measurement chain and is not a state-of-charge gauge. Threshold bars are coarse voltage bands and will vary with load, cell age, temperature, wiring loss, and ADC characteristics.
+The state-of-charge value uses a voltage curve. It is not a coulomb-counted result.
+
+See [Power, battery, and network control](POWER_AND_NETWORK.md) for the calibration procedure.
 
 ## 8. Power behavior
 
-The reflective display itself is low power, but the current firmware keeps the ESP32-S3, Wi-Fi subsystem, SEN66 continuous measurement, and audio hardware available. The configured display-sleep interval suppresses display updates; it does not place the entire ESP32-S3 or SEN66 into a deep-power state.
+The firmware uses light sleep when battery voltage is below the external-power threshold.
 
-For long-duration battery operation, a future revision should:
+It also stops SEN66 measurements between sample windows. Stop and start commands keep power on the sensor.
 
-- stop continuous SEN66 measurement between scheduled samples if the required conditioning behavior allows it;
-- disconnect Wi-Fi except during scheduled synchronization windows;
-- persist state required across deep sleep;
-- use RTC wake;
-- disable the codec and amplifier outside audio events;
-- characterize actual current at the cell, not only nominal subsystem figures.
+The firmware disables Wi-Fi between scheduled requests. A GPIO 0 hold starts a five-minute Wi-Fi window.
 
+The audio amplifier enters shutdown after each sound. The display schedule uses the ST7305 sleep command.
+
+Measure current at the battery terminals before you make a battery-life claim.

@@ -194,6 +194,16 @@ void DisplayPort::RLCD_ColorClear(uint8_t color) {
   memset(DispBuffer, color, DisplayLen);
 }
 
+void DisplayPort::RLCD_Sleep() {
+  RLCD_SendCommand(0x10);
+  vTaskDelay(pdMS_TO_TICKS(120));
+}
+
+void DisplayPort::RLCD_Wake() {
+  RLCD_SendCommand(0x11);
+  vTaskDelay(pdMS_TO_TICKS(120));
+}
+
 void DisplayPort::RLCD_Display() {
   RLCD_SendCommand(0x2A);  // Column Address Set
   RLCD_SendData(0x12);

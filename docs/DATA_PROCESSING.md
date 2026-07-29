@@ -24,8 +24,8 @@ VOC Index and NOx Index must not be labeled as ppm or ppb. They are processed in
 
 The main page reports:
 
-- `SEN66 WAITING` when no valid processed frame has been received;
-- `SEN66 ACTIVE / PREHEATING` when a frame exists but VOC, NOx, or CO2 is still invalid;
+- `SEN66 WAITING` when no valid processed frame has been received.
+- `SEN66 ACTIVE / PREHEATING` when a frame exists but VOC, NOx, or CO2 is still invalid.
 - `SEN66 ACTIVE / READY` when those processed values are populated.
 
 This is an application-level readiness indication. It does not certify that the sensor has completed every long-term conditioning or accuracy-stabilization interval described by Sensirion.
@@ -103,12 +103,12 @@ EPA AQI reporting is based on defined pollutant averaging, truncation, quality-c
 
 Accordingly:
 
-- the displayed value is useful for trend awareness and local control;
-- it must not be represented as an official AQI observation;
-- it is not a substitute for a regulatory monitor;
+- the displayed value is useful for trend awareness and local control.
+- it must not be represented as an official AQI observation.
+- it is not a substitute for a regulatory monitor.
 - it is not a medical or life-safety measurement.
 
-The main LCD keeps indoor and outdoor AQI separate. The web weather page retains an arithmetic combined view for convenience; that value has no EPA-defined meaning.
+The main LCD keeps indoor and outdoor AQI separate. The web weather page retains an arithmetic combined view for convenience. that value has no EPA-defined meaning.
 
 ## 6. Outdoor data
 
@@ -120,30 +120,91 @@ The firmware requests:
 
 It parses:
 
-- current temperature and feels-like temperature;
-- humidity;
-- condition text;
-- wind speed and direction;
-- precipitation;
-- UV index;
-- PM2.5 and WeatherAPI's U.S. EPA category;
-- three daily forecasts;
-- sunrise and sunset;
+- current temperature and feels-like temperature.
+- humidity.
+- condition text.
+- wind speed and direction.
+- precipitation.
+- UV index.
+- PM2.5 and WeatherAPI's U.S. EPA category.
+- three daily forecasts.
+- sunrise and sunset.
 - hourly forecast records.
 
 Outdoor PM2.5 AQI is recalculated locally through the same PM2.5 interpolation routine used indoors. It is not taken directly from the WeatherAPI category integer.
 
 API schema reference: [WeatherAPI documentation](https://www.weatherapi.com/docs/).
 
-## 7. Hourly selection
+## 7. OpenWeather data
+
+OpenWeather One Call 4.0 supplies up to 60 one-minute precipitation records.
+
+The firmware stores the precipitation rate and time for each record. The minute page shows these records as a bar chart.
+
+The Air Pollution API supplies outdoor PM2.5 and PM10 concentrations.
+
+The firmware calculates U.S. particle AQI from both concentrations. It uses the higher sub-index as outdoor AQI.
+
+The OpenWeather `main.aqi` value uses a separate five-level scale. The firmware does not display that value as U.S. AQI.
+
+## 8. Coordinate-derived timezone and local clock
+
+The same Forecast API response used for weather provides:
+
+- `location.tz_id`.
+- `location.localtime_epoch`.
+- `location.localtime`.
+
+The firmware interprets the local calendar fields against the returned epoch to
+derive the current UTC offset, including the offset currently produced by DST.
+It supports whole-hour, half-hour, and quarter-hour civil offsets. A fixed
+POSIX environment string is generated for the resolved current offset, NTP
+supplies absolute UTC time, and the location-local result is written to the
+PCF85063A RTC.
+
+The IANA timezone and offset are stored in NVS only when they change. Every
+successful 30-minute WeatherAPI update recalculates the offset, so an online
+station follows DST transitions without a firmware rebuild. During an offline
+reboot, the most recently resolved offset is used until weather service
+connectivity returns.
+
+Changing latitude/longitude through the web interface invalidates the prior
+weather data and schedules a new request. A successful request updates weather,
+timezone, and RTC together. The API-provided sunrise and sunset strings are
+already local to the same resolved location.
+
+## 9. Pressure-assisted forced CO2 recalibration
+
+The web calibration workflow parses WeatherAPI `current.pressure_mb`, validates
+700-1200 hPa, rounds it to an integer hPa, and sends it through
+`setAmbientPressure()` before the outdoor stabilization period. Cached pressure
+is not accepted when a calibration is started.
+
+Qualification requires five uninterrupted minutes with valid reported CO2 in
+the 350-450 ppm band. An invalid frame or excursion resets the timer. The
+firmware then stops continuous measurement, waits 1500 ms, performs forced
+recalibration with a 400 ppm target, checks both the I2C result and the
+`0xFFFF` failure sentinel, and restarts continuous measurement.
+
+The correction reported by the library is converted for display as:
+
+```text
+correction_ppm = returned_uint16 - 0x8000
+```
+
+The FRC is persistent in the sensor. Pressure compensation is applied before
+qualification because pressure changes the CO2 measurement. The system cannot
+independently verify outdoor placement or establish a traceable reference-gas
+concentration.
+
+## 10. Hourly selection
 
 The parser scans up to 72 hourly records across the three forecast days. It selects the first six records with `time_epoch` later than the current system epoch. This allows the list to cross midnight rather than restarting at 00:00 or stopping at the end of the first forecast day.
 
 System time is preferred. WeatherAPI `localtime_epoch` is used as a fallback if system time is not valid.
 
-## 8. History buffers
+## 11. History buffers
 
 Temperature and humidity histories contain 24 entries sampled every 15 minutes. At capacity, each graph represents six hours. History is RAM-resident and is reset at boot.
 
 The firmware seeds the arrays at startup so the graph has defined numeric content, but it does not claim those seeded entries are historical observations. Operational interpretation should begin after real samples have accumulated.
-
