@@ -1,5 +1,21 @@
 # Change Log
 
+## Display, sensor comparison, and startup diagnostics - 2026-07-29
+
+- Added a complete startup scan for I2C addresses `0x01` through `0x7E`.
+- Added expected, missing, unknown, and bus-error classifications to the serial log.
+- Added a 60-second ST7305 high-power interaction window after each button press.
+- Set the ST7305 low-power frame rate to 0.5 Hz.
+- Added ESP32-S3 hardware USB host detection.
+- Added 15-second SHTC3 readings and paired SEN66 comparison logging.
+- Added 12-hour offset qualification with one-standard-deviation update gates.
+- Added corrected SHTC3 fallback data while the SEN66 is idle.
+- Added persistent FATFS storage for sensor comparison data and six-hour history.
+- Added three-decimal battery voltage to each serial sensor update.
+- Added OpenWeather 15-minute temperature, rain probability, and alert processing.
+- Added one-time automatic selection of the 60-minute page for each new weather event.
+- Rebuilt the 60-minute page with four measurement boxes, a clock, and battery charge.
+
 ## Power and weather revision - 2026-07-29
 
 - Replaced the battery ADC equation with calibrated millivolt sampling and the board divider ratio.

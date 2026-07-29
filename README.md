@@ -14,8 +14,8 @@ The 400 x 300 reflective LCD has 14 pages. A local web interface controls settin
 - Application framework: Arduino-ESP32
 - Reference build date: 2026-07-29
 - Reference core: Espressif Arduino-ESP32 3.3.11
-- Reference binary size: 1,351,061 bytes
-- Reference dynamic allocation: 52,648 bytes of global data
+- Reference binary size: 1,401,057 bytes
+- Reference dynamic allocation: 53,008 bytes of global data
 - Display units: degrees Fahrenheit and miles per hour
 - Primary indoor sensor: Sensirion SEN66 at I2C address `0x6B`
 
@@ -48,7 +48,7 @@ Indoor particle AQI is calculated locally from the current PM2.5 and PM10 readin
 | 2 | North American Time Zones |
 | 3 | Outdoor Conditions |
 | 4 | Next Six Forecast Hours |
-| 5 | OpenWeather 60-Minute Rain Forecast |
+| 5 | Next 60 Minutes: outside temperature, indoor measurements, precipitation, clock, and battery |
 | 6 | Three-Day Forecast |
 | 7 | Northern Hemisphere Seasons |
 | 8 | Season Orbit |
@@ -150,6 +150,7 @@ The display driver allocates its frame buffer and lookup tables in PSRAM. A buil
 | Operation | Interval |
 |---|---:|
 | SEN66 read while active | 1 second |
+| SHTC3 read | 15 seconds |
 | SEN66 low-power duty cycle | 90 seconds per 10-minute slot |
 | SEN66 hourly conditioning | minute 50 through minute 59 |
 | Battery ADC read | 10 seconds |
@@ -159,8 +160,16 @@ The display driver allocates its frame buffer and lookup tables in PSRAM. A buil
 | OpenWeather normal refresh | 30 minutes |
 | OpenWeather rain refresh | 10 minutes for up to 2 hours |
 | NTP synchronization | 24 hours |
-| LCD update limit | 0.5 Hz |
+| LCD update limit in low-power mode | 0.5 Hz |
+| LCD update limit in high-power mode | 4 Hz during interaction or external power |
 | LCD auto-cycle dwell | 3 to 300 seconds, configurable |
+
+The firmware compares the SEN66 against the onboard SHTC3 while both sensors operate.
+It logs paired data to FATFS and qualifies the offset after 12 hours.
+After qualification, corrected SHTC3 data supplies temperature and humidity while the SEN66 is idle.
+
+Each boot scans all I2C addresses from `0x01` through `0x7E`.
+The serial report names expected devices, missing devices, bus errors, and unknown responders.
 
 ## Documentation index
 

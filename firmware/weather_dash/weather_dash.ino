@@ -28,6 +28,8 @@
 #include <time.h>
 #include <math.h>
 #include <Wire.h>
+#include <FS.h>
+#include <FFat.h>
 #include <esp_sleep.h>
 #include <driver/gpio.h>
 #include <SensirionI2cSen66.h>
@@ -62,6 +64,7 @@ const int BTN_LEFT    = 0;
 const int BTN_MIDDLE  = 18;
 const int BAT_ADC_PIN = 4;
 static const uint8_t SEN66_ADDR = 0x6B;
+static const uint8_t SHTC3_ADDR = 0x70;
 
 // Schematic R21/R23 divider: 200 kOhm / 100 kOhm, therefore VBAT = VADC * 3.
 // Leave this at 1.000 until a rested-cell reading is compared with a DMM.
@@ -70,6 +73,13 @@ static constexpr float BATTERY_CALIBRATION = 1.000f;
 static constexpr float EXTERNAL_POWER_ENTER_V = 4.18f;
 static constexpr float EXTERNAL_POWER_EXIT_V = 4.12f;
 static constexpr unsigned long DISPLAY_UPDATE_MS = 2000UL;  // 0.5 Hz
+static constexpr unsigned long DISPLAY_INTERACTIVE_UPDATE_MS = 250UL;
+static constexpr unsigned long DISPLAY_INTERACTIVE_WINDOW_MS = 60000UL;
+static constexpr unsigned long SHTC3_UPDATE_MS = 15000UL;
+static constexpr unsigned long HISTORY_UPDATE_MS = 900000UL;
+static constexpr uint32_t HISTORY_WINDOW_SECONDS = 21600UL;
+static constexpr uint32_t SENSOR_COMPARE_QUALIFY_SECONDS = 43200UL;
+static constexpr uint32_t SENSOR_COMPARE_MIN_SAMPLES = 100UL;
 static constexpr unsigned long WIFI_NORMAL_MS = 1800000UL;
 static constexpr unsigned long WIFI_RAIN_MS = 600000UL;
 static constexpr unsigned long WIFI_MANUAL_WINDOW_MS = 300000UL;
@@ -93,8 +103,13 @@ float humidity       = 0.0f;
 float batteryVoltage = 0.0f;
 float batterySoc     = 0.0f;
 bool  batteryStateInitialized = false;
+bool  voltageExternalPowerLikely = false;
+bool  usbHostConnected = false;
 bool  externalPowerLikely = false;
 bool  lowPowerMode   = false;
+bool  displayHighPower = true;
+unsigned long displayInteractiveUntilMs = 0;
+unsigned long lastUsbCheckMs = 0;
 int   wifiRSSI       = 0;
 int   hour24         = 0;
 int   minuteVal      = 0;
@@ -174,11 +189,17 @@ struct OwmMinuteData {
   int count;
   float maxPrecipitation;
   bool rainNext30;
+  float outsideTempF;
+  int rainChance;
+  bool outsideValid;
+  bool severeWeather;
+  uint32_t alertHash;
   bool valid;
   unsigned long lastUpdate;
 } owmMinute;
 unsigned long rainBoostUntilMs = 0;
 bool rainEventArmed = true;
+uint32_t acknowledgedAlertHash = 0;
 uint16_t owmCallsToday = 0;
 int owmCallDay = -1;
 
@@ -277,11 +298,34 @@ struct HourlyData {
 struct HistoricalData {
   float tempHistory[HISTORY_SIZE];
   float humidityHistory[HISTORY_SIZE];
+  uint32_t epoch[HISTORY_SIZE];
   int   currentIndex;
   unsigned long lastLogTime;
   bool  initialized;
   int   sampleCount;
 } history;
+
+struct SensorComparisonState {
+  bool shtc3Present;
+  bool shtc3Valid;
+  bool qualified;
+  float shtc3Temperature;
+  float shtc3Humidity;
+  uint32_t firstPairEpoch;
+  uint32_t lastPairEpoch;
+  uint32_t pairCount;
+  double meanTempDeltaC;
+  double meanHumidityDelta;
+  double m2TempDelta;
+  double m2HumidityDelta;
+  double tempVariance;
+  double humidityVariance;
+  unsigned long lastShtc3ReadMs;
+  unsigned long lastPairedShtc3ReadMs;
+  unsigned long lastPersistMs;
+} sensorComparison = {};
+
+bool storageReady = false;
 
 struct GraphBounds { float mn, mx, rng; };
 
@@ -332,7 +376,7 @@ unsigned long autoCycleLastMs  = 0;      // millis() of last auto-cycle step
 bool          sleepEnabled    = false;   // NVS "sleep_en"  — disabled by default
 int           sleepFromHour   = 23;      // NVS "sleep_from"
 int           sleepToHour     = 6;       // NVS "sleep_to"
-unsigned long sleepWakeUntil  = 0;       // millis() deadline for 10 s button wake
+unsigned long sleepWakeUntil  = 0;       // millis() deadline for temporary display wake
 
 // ===== TIMERS & ALARMS =====
 #define ALARM_COUNT 3
@@ -792,6 +836,386 @@ const char* getTZLabel() {
   return label;
 }
 
+uint32_t currentEpoch() {
+  time_t systemNow = time(nullptr);
+  if (systemNow >= 1700000000) return (uint32_t)systemNow;
+
+  int year = rtc.getYear();
+  int month = rtc.getMonth();
+  int day = rtc.getDay();
+  if (year < 2024 || month < 1 || month > 12 || day < 1 || day > 31) return 0;
+  int64_t localSeconds =
+    daysFromCivil(year, (unsigned)month, (unsigned)day) * 86400LL +
+    rtc.getHour() * 3600LL + rtc.getMinute() * 60LL + rtc.getSecond();
+  int64_t utcSeconds = localSeconds - gmtOffset_sec;
+  return utcSeconds > 0 ? (uint32_t)utcSeconds : 0;
+}
+
+bool shtc3SendCommand(uint16_t command) {
+  Wire.beginTransmission(SHTC3_ADDR);
+  Wire.write((uint8_t)(command >> 8));
+  Wire.write((uint8_t)(command & 0xFF));
+  return Wire.endTransmission() == 0;
+}
+
+uint8_t sensirionCrc8(const uint8_t* data, size_t length) {
+  uint8_t crc = 0xFF;
+  for (size_t i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; bit++)
+      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
+  }
+  return crc;
+}
+
+const char* expectedI2cDevice(uint8_t address) {
+  switch (address) {
+    case 0x18: return "ES8311 audio codec";
+    case 0x40: return "ES7210 microphone ADC";
+    case 0x51: return "PCF85063A RTC";
+    case 0x6B: return "SEN66 external air-quality sensor";
+    case 0x70: return "SHTC3 onboard temperature/humidity sensor";
+    default: return nullptr;
+  }
+}
+
+void scanI2cBusAtStartup() {
+  // A retained SHTC3 sleep state can survive an ESP32-only reset.
+  shtc3SendCommand(0x3517);
+  delay(2);
+
+  static const uint8_t expected[] = {0x18, 0x40, 0x51, 0x6B, 0x70};
+  bool foundExpected[sizeof(expected)] = {};
+  int foundCount = 0;
+  int unknownCount = 0;
+
+  Serial.println("[I2C] Startup scan on SDA=GPIO13, SCL=GPIO14");
+  for (uint8_t address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    uint8_t error = Wire.endTransmission();
+    if (error == 0) {
+      foundCount++;
+      const char* name = expectedI2cDevice(address);
+      if (name) {
+        Serial.printf("[I2C] 0x%02X %s - EXPECTED (board schematic or configured external sensor)\n",
+                      address, name);
+        for (size_t i = 0; i < sizeof(expected); i++)
+          if (expected[i] == address) foundExpected[i] = true;
+      } else {
+        unknownCount++;
+        Serial.printf("[I2C] 0x%02X UNKNOWN - not listed for this firmware or board\n",
+                      address);
+      }
+    } else if (error == 4) {
+      Serial.printf("[I2C] 0x%02X BUS ERROR during address probe\n", address);
+    }
+  }
+
+  for (size_t i = 0; i < sizeof(expected); i++) {
+    if (!foundExpected[i]) {
+      Serial.printf("[I2C] 0x%02X MISSING - expected %s\n",
+                    expected[i], expectedI2cDevice(expected[i]));
+    }
+  }
+  Serial.printf("[I2C] Scan complete: %d responder(s), %d unknown\n",
+                foundCount, unknownCount);
+  shtc3SendCommand(0xB098);
+}
+
+bool readShtc3(float& temperatureC, float& relativeHumidity) {
+  if (!shtc3SendCommand(0x3517)) return false;
+  delay(1);
+  if (!shtc3SendCommand(0x7866)) return false;
+  delay(15);
+
+  uint8_t data[6] = {};
+  size_t received = Wire.requestFrom((int)SHTC3_ADDR, 6);
+  if (received != 6) {
+    shtc3SendCommand(0xB098);
+    return false;
+  }
+  for (int i = 0; i < 6; i++) data[i] = Wire.read();
+  shtc3SendCommand(0xB098);
+  if (sensirionCrc8(data, 2) != data[2] ||
+      sensirionCrc8(data + 3, 2) != data[5]) return false;
+
+  uint16_t rawTemperature = ((uint16_t)data[0] << 8) | data[1];
+  uint16_t rawHumidity = ((uint16_t)data[3] << 8) | data[4];
+  temperatureC = -45.0f + 175.0f * rawTemperature / 65535.0f;
+  relativeHumidity = constrain(100.0f * rawHumidity / 65535.0f, 0.0f, 100.0f);
+  return isfinite(temperatureC) && isfinite(relativeHumidity);
+}
+
+struct PersistedComparisonState {
+  uint32_t magic;
+  uint16_t version;
+  uint8_t qualified;
+  uint8_t reserved;
+  uint32_t firstPairEpoch;
+  uint32_t lastPairEpoch;
+  uint32_t pairCount;
+  double meanTempDeltaC;
+  double meanHumidityDelta;
+  double m2TempDelta;
+  double m2HumidityDelta;
+  double tempVariance;
+  double humidityVariance;
+};
+
+void persistSensorComparisonState(bool forceWrite = false) {
+  if (!forceWrite && millis() - sensorComparison.lastPersistMs < 3600000UL) return;
+  PersistedComparisonState saved = {
+    0x53433636UL, 1, (uint8_t)sensorComparison.qualified, 0,
+    sensorComparison.firstPairEpoch, sensorComparison.lastPairEpoch,
+    sensorComparison.pairCount, sensorComparison.meanTempDeltaC,
+    sensorComparison.meanHumidityDelta, sensorComparison.m2TempDelta,
+    sensorComparison.m2HumidityDelta, sensorComparison.tempVariance,
+    sensorComparison.humidityVariance
+  };
+  prefs.begin("dash", false);
+  prefs.putBytes("sensor_cmp", &saved, sizeof(saved));
+  prefs.end();
+  sensorComparison.lastPersistMs = millis();
+}
+
+void loadSensorComparisonState() {
+  PersistedComparisonState saved = {};
+  prefs.begin("dash", true);
+  size_t storedLength = prefs.getBytesLength("sensor_cmp");
+  if (storedLength == sizeof(saved)) prefs.getBytes("sensor_cmp", &saved, sizeof(saved));
+  prefs.end();
+  if (storedLength != sizeof(saved) || saved.magic != 0x53433636UL ||
+      saved.version != 1) return;
+  sensorComparison.qualified = saved.qualified != 0;
+  sensorComparison.firstPairEpoch = saved.firstPairEpoch;
+  sensorComparison.lastPairEpoch = saved.lastPairEpoch;
+  sensorComparison.pairCount = saved.pairCount;
+  sensorComparison.meanTempDeltaC = saved.meanTempDeltaC;
+  sensorComparison.meanHumidityDelta = saved.meanHumidityDelta;
+  sensorComparison.m2TempDelta = saved.m2TempDelta;
+  sensorComparison.m2HumidityDelta = saved.m2HumidityDelta;
+  sensorComparison.tempVariance = saved.tempVariance;
+  sensorComparison.humidityVariance = saved.humidityVariance;
+}
+
+bool mountStorage() {
+  storageReady = FFat.begin(false);
+  if (!storageReady) {
+    Serial.println("[FFAT] Mount failed. Formatting the configured FATFS partition.");
+    storageReady = FFat.begin(true);
+  }
+  if (storageReady) {
+    Serial.printf("[FFAT] Mounted: %llu bytes total, %llu bytes used\n",
+                  (unsigned long long)FFat.totalBytes(),
+                  (unsigned long long)FFat.usedBytes());
+  } else {
+    Serial.println("[FFAT] Storage unavailable. Comparison and history files are disabled.");
+  }
+  return storageReady;
+}
+
+void appendSensorComparisonLog(uint32_t epoch, float senTemperature,
+                               float senHumidity, float shtTemperature,
+                               float shtHumidity) {
+  if (!storageReady) return;
+  const char* path = "/sensor_compare.csv";
+  File existing = FFat.open(path, FILE_READ);
+  size_t currentSize = existing ? existing.size() : 0;
+  existing.close();
+  if (currentSize > 4UL * 1024UL * 1024UL) {
+    FFat.remove("/sensor_compare.old.csv");
+    FFat.rename(path, "/sensor_compare.old.csv");
+    currentSize = 0;
+  }
+  File file = FFat.open(path, FILE_APPEND);
+  if (!file) {
+    Serial.println("[FFAT] Could not append /sensor_compare.csv");
+    return;
+  }
+  if (currentSize == 0)
+    file.println("epoch,sen66_temp_c,sen66_rh,shtc3_temp_c,shtc3_rh,temp_delta_c,rh_delta");
+  file.printf("%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+              (unsigned long)epoch, senTemperature, senHumidity,
+              shtTemperature, shtHumidity, senTemperature - shtTemperature,
+              senHumidity - shtHumidity);
+  file.close();
+}
+
+void recordSensorComparison() {
+  if (!sensorComparison.shtc3Valid ||
+      sensorComparison.lastShtc3ReadMs == sensorComparison.lastPairedShtc3ReadMs ||
+      !indoor.valid) return;
+  sensorComparison.lastPairedShtc3ReadMs = sensorComparison.lastShtc3ReadMs;
+  uint32_t epoch = currentEpoch();
+  float rawTempDelta = indoor.temperature - sensorComparison.shtc3Temperature;
+  float rawHumidityDelta = indoor.humidity - sensorComparison.shtc3Humidity;
+  float tempDelta = constrain(rawTempDelta, -10.0f, 10.0f);
+  float humidityDelta = constrain(rawHumidityDelta, -30.0f, 30.0f);
+  appendSensorComparisonLog(epoch, indoor.temperature, indoor.humidity,
+                            sensorComparison.shtc3Temperature,
+                            sensorComparison.shtc3Humidity);
+
+  if (!sensorComparison.qualified) {
+    if (sensorComparison.firstPairEpoch == 0 && epoch != 0)
+      sensorComparison.firstPairEpoch = epoch;
+    sensorComparison.lastPairEpoch = epoch;
+    sensorComparison.pairCount++;
+    double tempDifference = tempDelta - sensorComparison.meanTempDeltaC;
+    sensorComparison.meanTempDeltaC += tempDifference / sensorComparison.pairCount;
+    sensorComparison.m2TempDelta +=
+      tempDifference * (tempDelta - sensorComparison.meanTempDeltaC);
+    double humidityDifference =
+      humidityDelta - sensorComparison.meanHumidityDelta;
+    sensorComparison.meanHumidityDelta +=
+      humidityDifference / sensorComparison.pairCount;
+    sensorComparison.m2HumidityDelta +=
+      humidityDifference * (humidityDelta - sensorComparison.meanHumidityDelta);
+
+    bool elapsed = epoch != 0 && sensorComparison.firstPairEpoch != 0 &&
+      epoch >= sensorComparison.firstPairEpoch &&
+      epoch - sensorComparison.firstPairEpoch >= SENSOR_COMPARE_QUALIFY_SECONDS;
+    if (elapsed && sensorComparison.pairCount >= SENSOR_COMPARE_MIN_SAMPLES) {
+      sensorComparison.tempVariance =
+        sensorComparison.m2TempDelta / max(1UL, sensorComparison.pairCount - 1);
+      sensorComparison.humidityVariance =
+        sensorComparison.m2HumidityDelta / max(1UL, sensorComparison.pairCount - 1);
+      sensorComparison.qualified = true;
+      Serial.printf("[SENSOR COMPARE] Qualified after %lu pairs. Delta T=%+.3fC, RH=%+.3f%%\n",
+                    (unsigned long)sensorComparison.pairCount,
+                    sensorComparison.meanTempDeltaC,
+                    sensorComparison.meanHumidityDelta);
+      persistSensorComparisonState(true);
+    } else {
+      persistSensorComparisonState(sensorComparison.pairCount == 1);
+    }
+    return;
+  }
+
+  const double alpha = 0.02;
+  double tempSigma = max(0.10, sqrt(max(0.0, sensorComparison.tempVariance)));
+  double humiditySigma =
+    max(1.00, sqrt(max(0.0, sensorComparison.humidityVariance)));
+  if (fabs(tempDelta - sensorComparison.meanTempDeltaC) <= tempSigma) {
+    double difference = tempDelta - sensorComparison.meanTempDeltaC;
+    sensorComparison.meanTempDeltaC += alpha * difference;
+    sensorComparison.tempVariance =
+      (1.0 - alpha) * (sensorComparison.tempVariance + alpha * difference * difference);
+  }
+  if (fabs(humidityDelta - sensorComparison.meanHumidityDelta) <= humiditySigma) {
+    double difference = humidityDelta - sensorComparison.meanHumidityDelta;
+    sensorComparison.meanHumidityDelta += alpha * difference;
+    sensorComparison.humidityVariance =
+      (1.0 - alpha) *
+      (sensorComparison.humidityVariance + alpha * difference * difference);
+  }
+  sensorComparison.pairCount++;
+  sensorComparison.lastPairEpoch = epoch;
+  persistSensorComparisonState(false);
+}
+
+void serviceShtc3(bool forceRead = false) {
+  unsigned long now = millis();
+  if (!forceRead && sensorComparison.lastShtc3ReadMs != 0 &&
+      now - sensorComparison.lastShtc3ReadMs < SHTC3_UPDATE_MS) return;
+  float shtTemperature = NAN;
+  float shtHumidity = NAN;
+  if (!readShtc3(shtTemperature, shtHumidity)) {
+    sensorComparison.shtc3Valid = false;
+    Serial.printf("[SHTC3] Read failed. VBAT=%.3fV\n", batteryVoltage);
+    return;
+  }
+  sensorComparison.shtc3Present = true;
+  sensorComparison.shtc3Valid = true;
+  sensorComparison.shtc3Temperature = shtTemperature;
+  sensorComparison.shtc3Humidity = shtHumidity;
+  sensorComparison.lastShtc3ReadMs = now;
+
+  if (!sen66MeasurementRunning) {
+    temperature = shtTemperature +
+      (sensorComparison.qualified ? sensorComparison.meanTempDeltaC : 0.0);
+    humidity = constrain(
+      shtHumidity +
+      (sensorComparison.qualified ? sensorComparison.meanHumidityDelta : 0.0),
+      0.0, 100.0);
+  }
+  Serial.printf("[SHTC3] T=%.2fC RH=%.2f%% source=%s VBAT=%.3fV\n",
+                shtTemperature, shtHumidity,
+                sensorComparison.qualified ? "corrected fallback ready" : "raw",
+                batteryVoltage);
+}
+
+int historyStartIndex() {
+  return history.sampleCount >= HISTORY_SIZE ? history.currentIndex : 0;
+}
+
+void persistHistory() {
+  if (!storageReady) return;
+  FFat.remove("/history.tmp");
+  File file = FFat.open("/history.tmp", FILE_WRITE);
+  if (!file) {
+    Serial.println("[FFAT] Could not write /history.tmp");
+    return;
+  }
+  file.println("epoch,temperature_f,humidity_percent");
+  uint32_t nowEpoch = currentEpoch();
+  int start = historyStartIndex();
+  for (int i = 0; i < history.sampleCount; i++) {
+    int index = (start + i) % HISTORY_SIZE;
+    uint32_t pointEpoch = history.epoch[index];
+    if (nowEpoch != 0 && pointEpoch != 0 && nowEpoch >= pointEpoch &&
+        nowEpoch - pointEpoch > HISTORY_WINDOW_SECONDS) continue;
+    file.printf("%lu,%.3f,%.3f\n", (unsigned long)pointEpoch,
+                history.tempHistory[index], history.humidityHistory[index]);
+  }
+  file.close();
+  FFat.remove("/history.csv");
+  if (!FFat.rename("/history.tmp", "/history.csv"))
+    Serial.println("[FFAT] Could not replace /history.csv");
+}
+
+void appendHistoryPoint(float temperatureF, float relativeHumidity) {
+  history.tempHistory[history.currentIndex] = temperatureF;
+  history.humidityHistory[history.currentIndex] = relativeHumidity;
+  history.epoch[history.currentIndex] = currentEpoch();
+  history.currentIndex = (history.currentIndex + 1) % HISTORY_SIZE;
+  if (history.sampleCount < HISTORY_SIZE) history.sampleCount++;
+  history.initialized = history.sampleCount >= HISTORY_SIZE;
+  history.lastLogTime = millis();
+  persistHistory();
+}
+
+void loadHistory() {
+  history = {};
+  history.lastLogTime = millis();
+  if (!storageReady) return;
+  File file = FFat.open("/history.csv", FILE_READ);
+  if (!file) {
+    Serial.println("[HISTORY] No stored six-hour history.");
+    return;
+  }
+  uint32_t nowEpoch = currentEpoch();
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    unsigned long epochValue = 0;
+    float temperatureF = 0.0f;
+    float relativeHumidity = 0.0f;
+    if (sscanf(line.c_str(), "%lu,%f,%f", &epochValue,
+               &temperatureF, &relativeHumidity) != 3) continue;
+    if (nowEpoch != 0 && epochValue != 0 && nowEpoch >= epochValue &&
+        nowEpoch - (uint32_t)epochValue > HISTORY_WINDOW_SECONDS) continue;
+    history.tempHistory[history.currentIndex] = temperatureF;
+    history.humidityHistory[history.currentIndex] = relativeHumidity;
+    history.epoch[history.currentIndex] = (uint32_t)epochValue;
+    history.currentIndex = (history.currentIndex + 1) % HISTORY_SIZE;
+    if (history.sampleCount < HISTORY_SIZE) history.sampleCount++;
+  }
+  file.close();
+  history.initialized = history.sampleCount >= HISTORY_SIZE;
+  Serial.printf("[HISTORY] Restored %d temperature/humidity point(s).\n",
+                history.sampleCount);
+  persistHistory();
+}
+
 // ===== CENTERED TEXT HELPER =====
 void printCentered(const GFXfont* font, int y, const char* text) {
   canvas.setFont(font);
@@ -924,6 +1348,7 @@ bool readSen66() {
   indoor.lastUpdate = millis();
   temperature = indoor.temperature;
   humidity = indoor.humidity;
+  recordSensorComparison();
   return true;
 }
 
@@ -1139,11 +1564,51 @@ void updateBatteryState(float measuredVoltage) {
   batteryStateInitialized = true;
 
   // Hysteresis prevents Wi-Fi and SEN66 load steps from rapidly changing modes.
-  if (!externalPowerLikely && measuredVoltage >= EXTERNAL_POWER_ENTER_V)
-    externalPowerLikely = true;
-  else if (externalPowerLikely && measuredVoltage <= EXTERNAL_POWER_EXIT_V)
-    externalPowerLikely = false;
+  if (!voltageExternalPowerLikely && measuredVoltage >= EXTERNAL_POWER_ENTER_V)
+    voltageExternalPowerLikely = true;
+  else if (voltageExternalPowerLikely && measuredVoltage <= EXTERNAL_POWER_EXIT_V)
+    voltageExternalPowerLikely = false;
+  externalPowerLikely = usbHostConnected || voltageExternalPowerLikely;
   lowPowerMode = !externalPowerLikely;
+}
+
+void serviceUsbHostState(bool forceCheck = false) {
+  unsigned long now = millis();
+  if (!forceCheck && now - lastUsbCheckMs < 1000UL) return;
+  lastUsbCheckMs = now;
+  bool plugged = false;
+#if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+  plugged = Serial.isPlugged();
+#endif
+  if (plugged != usbHostConnected) {
+    usbHostConnected = plugged;
+    Serial.printf("[POWER] USB host %s\n", plugged ? "connected" : "disconnected");
+  }
+  externalPowerLikely = usbHostConnected || voltageExternalPowerLikely;
+  lowPowerMode = !externalPowerLikely;
+}
+
+bool displayInteractive() {
+  return (long)(displayInteractiveUntilMs - millis()) > 0;
+}
+
+void activateDisplayInteractiveWindow() {
+  displayInteractiveUntilMs = millis() + DISPLAY_INTERACTIVE_WINDOW_MS;
+  sleepWakeUntil = max(sleepWakeUntil, displayInteractiveUntilMs);
+  if (!displayHighPower) {
+    RlcdPort.RLCD_SetPowerMode(true);
+    displayHighPower = true;
+  }
+  lastDisplayUpdateMs = 0;
+}
+
+void serviceDisplayPowerMode() {
+  bool requestedHighPower = externalPowerLikely || displayInteractive();
+  if (requestedHighPower == displayHighPower) return;
+  RlcdPort.RLCD_SetPowerMode(requestedHighPower);
+  displayHighPower = requestedHighPower;
+  Serial.printf("[DISPLAY] %s mode\n",
+                requestedHighPower ? "high-power interactive" : "low-power 0.5 Hz");
 }
 
 void logBatteryTrend() {
@@ -1169,7 +1634,7 @@ float estimatedHoursTo20Percent() {
 
 // Returns true if the display should currently be sleeping.
 // Handles midnight-spanning windows (e.g. 23:00 -> 06:00).
-// Overridden to false when a 10 s button-wake is active.
+// Overridden to false during the 60-second button interaction window.
 bool isDisplaySleeping() {
   if (!sleepEnabled) return false;
   if (millis() < sleepWakeUntil) return false;
@@ -1372,6 +1837,15 @@ bool consumeOwmCallBudget() {
   return true;
 }
 
+uint32_t hashOwmAlertId(uint32_t hash, const String& value) {
+  if (hash == 0) hash = 2166136261UL;
+  for (size_t i = 0; i < value.length(); i++) {
+    hash ^= (uint8_t)value[i];
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
 bool fetchOpenWeatherMapData() {
   if (!wifiConnected || strlen(OpenWeatherMapApiKey) < 8) return false;
   float lat = 0.0f, lon = 0.0f;
@@ -1422,6 +1896,47 @@ bool fetchOpenWeatherMapData() {
     http.end();
   }
 
+  bool quarterHourOk = false;
+  if (consumeOwmCallBudget()) {
+    HTTPClient http;
+    String url = "https://api.openweathermap.org/data/4.0/onecall/timeline/15min?lat=" +
+                 String(lat, 6) + "&lon=" + String(lon, 6) +
+                 "&units=imperial&appid=" + String(OpenWeatherMapApiKey);
+    http.begin(url);
+    http.setTimeout(15000);
+    int code = http.GET();
+    if (code == 200) {
+      JsonDocument filter;
+      filter["data"][0]["temp"] = true;
+      filter["data"][0]["pop"] = true;
+      filter["data"][0]["weather"][0]["id"] = true;
+      filter["data"][0]["alerts"][0] = true;
+      JsonDocument doc;
+      DeserializationError error =
+        deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+      if (!error && !doc["data"][0].isNull()) {
+        owmMinute.outsideTempF = doc["data"][0]["temp"] | NAN;
+        float probability = doc["data"][0]["pop"] | 0.0f;
+        owmMinute.rainChance =
+          constrain((int)lroundf(probability * 100.0f), 0, 100);
+        owmMinute.outsideValid = isfinite(owmMinute.outsideTempF);
+        uint32_t alertHash = 0;
+        for (JsonVariant alert : doc["data"][0]["alerts"].as<JsonArray>()) {
+          String identifier = alert.as<String>();
+          alertHash = hashOwmAlertId(alertHash, identifier);
+        }
+        owmMinute.alertHash = alertHash;
+        owmMinute.severeWeather = alertHash != 0;
+        quarterHourOk = owmMinute.outsideValid;
+      } else {
+        Serial.printf("[OWM] 15-minute JSON error: %s\n", error.c_str());
+      }
+    } else {
+      Serial.printf("[OWM] 15-minute request HTTP %d\n", code);
+    }
+    http.end();
+  }
+
   bool airOk = false;
   if (consumeOwmCallBudget()) {
     HTTPClient http;
@@ -1455,20 +1970,37 @@ bool fetchOpenWeatherMapData() {
     http.end();
   }
 
-  if (minuteOk) {
-    if (owmMinute.rainNext30 && rainEventArmed) {
+  bool rainEventNow = (minuteOk && owmMinute.rainNext30) ||
+                      (quarterHourOk && owmMinute.rainChance > 0);
+  bool newRainEvent = rainEventNow && rainEventArmed;
+  bool newSevereEvent = owmMinute.severeWeather &&
+                        owmMinute.alertHash != acknowledgedAlertHash;
+  if (minuteOk || quarterHourOk) {
+    if (rainEventNow && rainEventArmed) {
       rainBoostUntilMs = millis() + 7200000UL;
       rainEventArmed = false;
       Serial.println("[OWM] Rain in next 30 minutes; 10-minute updates enabled for two hours.");
-    } else if (!owmMinute.rainNext30) {
+    } else if (!rainEventNow) {
       rainEventArmed = true;
       rainBoostUntilMs = 0;
     }
   }
-  Serial.printf("[OWM] Minute=%s air=%s calls today=%u\n",
-                minuteOk ? "OK" : "failed", airOk ? "OK" : "failed",
-                owmCallsToday);
-  return minuteOk || airOk;
+  if (owmMinute.severeWeather)
+    acknowledgedAlertHash = owmMinute.alertHash;
+  else
+    acknowledgedAlertHash = 0;
+
+  if ((newRainEvent || newSevereEvent) && pageIsEnabled(5)) {
+    currentPage = 5;
+    lastDisplayUpdateMs = 0;
+    Serial.printf("[OWM] New %s event. Showing the next-60-minutes page once.\n",
+                  newSevereEvent ? "severe-weather" : "rain");
+  }
+  Serial.printf("[OWM] Minute=%s 15-minute=%s air=%s calls today=%u\n",
+                minuteOk ? "OK" : "failed",
+                quarterHourOk ? "OK" : "failed",
+                airOk ? "OK" : "failed", owmCallsToday);
+  return minuteOk || quarterHourOk || airOk;
 }
 
 bool fetchAllOnlineData() {
@@ -1961,8 +2493,10 @@ void drawSystemPage() {
   String ssidStr = wifiConnected ? String(activeSsid) : "--";
   if (ssidStr.length() > 20) ssidStr = ssidStr.substring(0, 20); // FONT_SMALL safe up to ~26 chars
   String chanStr  = wifiConnected ? String(WiFi.channel()) : "--";
-  int total = sensorReadCount + sensorFailCount;
-  String readsStr = total > 0 ? String(sensorReadCount) + "/" + String(total) + " ok" : "No reads";
+  String tempDelta = sensorComparison.pairCount > 0 ?
+    String(sensorComparison.meanTempDeltaC * 1.8, 2) + " F" : "No pairs";
+  String humidityDelta = sensorComparison.pairCount > 0 ?
+    String(sensorComparison.meanHumidityDelta, 2) + " %" : "No pairs";
 
   int gy = gy0;
   drawDetail(lx, gy, "WIFI",         wifiVal);
@@ -1973,8 +2507,9 @@ void drawSystemPage() {
   drawDetail(rx, gy, "NTP SYNC",     ntpStr);       gy += rowH;
   drawDetail(lx, gy, "NETWORK",      ssidStr, true);
   drawDetail(rx, gy, "CHANNEL",      chanStr);      gy += rowH;
-  drawDetail(lx, gy, "SENSOR",       (sensorFailCount == 0) ? "OK" : "Errors");
-  drawDetail(rx, gy, "SENSOR READS", readsStr);
+  drawDetail(lx, gy, "SEN66-SHTC3 TEMP", tempDelta, true);
+  drawDetail(rx, gy, sensorComparison.qualified ? "RH DELTA (QUALIFIED)" : "RH DELTA (LEARNING)",
+             humidityDelta, true);
 
   canvas.fillRect(8, 264, 384, 2, 1);
   canvas.setFont(&FONT_SMALL); canvas.setCursor(12, 287);
@@ -2066,31 +2601,41 @@ void drawHourlyPage() {
   pushCanvasToRLCD(displayInvert);
 }
 
-// ===== PAGE 5: OPENWEATHER 60-MINUTE PRECIPITATION =====
+// ===== PAGE 5: 60-MINUTE PRECIPITATION =====
 void drawMinuteCastPage() {
   canvas.fillScreen(0);
   canvas.drawRect(0, 0, W, H, 1); canvas.drawRect(1, 1, W-2, H-2, 1);
   canvas.fillRect(8, 8, 384, 26, 1);
   canvas.setTextColor(0); canvas.setFont(&FONT_SMALL);
-  canvas.setCursor(15, 27); canvas.print("NEXT 60 MINUTES - OPENWEATHER");
+  canvas.setCursor(15, 27); canvas.print("NEXT 60 MINUTES");
+  char clockText[8];
+  snprintf(clockText, sizeof(clockText), "%02d:%02d", hour24, minuteVal);
+  canvas.setCursor(338, 27); canvas.print(clockText);
   canvas.setTextColor(1);
 
-  const int boxY = 42, boxH = 58, boxW = 122;
-  const char* labels[] = {"INDOOR TEMP", "HUMIDITY", "CO2"};
-  for (int i = 0; i < 3; i++) {
-    int x = 8 + i * 131;
+  const int boxY = 42, boxH = 58, boxW = 91;
+  const char* labels[] = {"OUTSIDE", "INSIDE", "HUMIDITY", "CO2"};
+  for (int i = 0; i < 4; i++) {
+    int x = 8 + i * 97;
     canvas.drawRect(x, boxY, boxW, boxH, 1);
-    canvas.setFont(&FONT_SMALL); canvas.setCursor(x + 7, boxY + 18);
+    canvas.setFont(&FONT_SMALL); canvas.setCursor(x + 5, boxY + 18);
     canvas.print(labels[i]);
-    canvas.setFont(&FONT_MEDIUM); canvas.setCursor(x + 7, boxY + 46);
-    if (!indoor.valid) canvas.print("--");
-    else if (i == 0) { canvas.print(cToF(indoor.temperature), 1); canvas.print(" F"); }
-    else if (i == 1) { canvas.print(indoor.humidity, 0); canvas.print(" %"); }
-    else if (indoor.co2 != 0xFFFF) { canvas.print(indoor.co2); canvas.print(" ppm"); }
-    else canvas.print("--");
+    canvas.setFont(&FONT_MEDIUM); canvas.setCursor(x + 5, boxY + 46);
+    if (i == 0) {
+      if (owmMinute.outsideValid) {
+        canvas.print(owmMinute.outsideTempF, 1); canvas.print(" F");
+      } else canvas.print("--");
+    } else if (i == 1) {
+      canvas.print(cToF(temperature), 1); canvas.print(" F");
+    } else if (i == 2) {
+      canvas.print(humidity, 0); canvas.print(" %");
+    } else if (indoor.valid && indoor.co2 != 0xFFFF) {
+      canvas.setFont(&FONT_SMALL); canvas.setCursor(x + 5, boxY + 44);
+      canvas.print(indoor.co2); canvas.print(" ppm");
+    } else canvas.print("--");
   }
 
-  const int gx = 24, gy = 126, gw = 352, gh = 120;
+  const int gx = 24, gy = 122, gw = 352, gh = 112;
   canvas.drawRect(gx, gy, gw, gh, 1);
   canvas.setFont(&FONT_SMALL);
   if (!owmMinute.valid || owmMinute.count == 0) {
@@ -2111,20 +2656,35 @@ void drawMinuteCastPage() {
       canvas.setCursor(constrain(x - 7, 4, 370), gy + gh + 18);
       canvas.print(m);
     }
-    canvas.setCursor(171, 284); canvas.print("minutes");
   }
 
   canvas.setCursor(12, 284);
   if (owmMinute.valid) {
     canvas.print(owmMinute.rainNext30 ? "RAIN <30M" : "DRY <30M");
   } else canvas.print("OWM OFFLINE");
+
+  const int batteryX = 326, batteryY = 270, batteryW = 59, batteryH = 20;
+  canvas.drawRect(batteryX, batteryY, batteryW, batteryH, 1);
+  canvas.fillRect(batteryX + batteryW, batteryY + 6, 4, 8, 1);
+  char socText[8];
+  snprintf(socText, sizeof(socText), "%d%%", (int)lroundf(batterySoc));
+  canvas.setFont(&FONT_SMALL);
+  int16_t x1, y1; uint16_t textW, textH;
+  canvas.getTextBounds(socText, 0, 0, &x1, &y1, &textW, &textH);
+  canvas.setCursor(batteryX + (batteryW - textW) / 2, batteryY + 15);
+  canvas.print(socText);
   pushCanvasToRLCD(displayInvert);
 }
 
 // ===== GRAPH HELPERS =====
-GraphBounds calcGraphBounds(float* data, int count, float minRange, float pad) {
+GraphBounds calcGraphBounds(float* data, int startIndex, int count,
+                            float minRange, float pad) {
   GraphBounds b = { 999.0f, -999.0f, 0.0f };
-  for (int i = 0; i < count; i++) { if (data[i] < b.mn) b.mn = data[i]; if (data[i] > b.mx) b.mx = data[i]; }
+  for (int i = 0; i < count; i++) {
+    float value = data[(startIndex + i) % HISTORY_SIZE];
+    if (value < b.mn) b.mn = value;
+    if (value > b.mx) b.mx = value;
+  }
   b.rng = b.mx - b.mn;
   if (b.rng < minRange) b.rng = minRange;
   b.mn -= pad; b.mx += pad; b.rng = b.mx - b.mn;
@@ -2189,7 +2749,8 @@ void drawTempGraphPage() {
   // Current value — FONT_LARGE fits header box without clipping
   canvas.setFont(&FONT_LARGE); canvas.setCursor(220, 38); canvas.print(cToF(temperature), 1);
   canvas.setFont(&FONT_SMALL); canvas.print(" F");
-  int tTrend = calcTrend(history.tempHistory, history.currentIndex, history.sampleCount);
+  int startIndex = historyStartIndex();
+  int tTrend = calcTrend(history.tempHistory, startIndex, history.sampleCount);
   drawTrendArrow(375, 22, tTrend);
 
   if (history.sampleCount < 2) {
@@ -2199,8 +2760,10 @@ void drawTempGraphPage() {
   }
 
   int gX = 44, gY = 52, gW = 336, gH = 168;
-  GraphBounds b = calcGraphBounds(history.tempHistory, HISTORY_SIZE, 5.0f, 1.0f);
-  drawEnhancedGraph(history.tempHistory, history.currentIndex, min((int)history.sampleCount,(int)HISTORY_SIZE), gX, gY, gW, gH, b, "F");
+  GraphBounds b = calcGraphBounds(history.tempHistory, startIndex,
+                                  history.sampleCount, 5.0f, 1.0f);
+  drawEnhancedGraph(history.tempHistory, startIndex, history.sampleCount,
+                    gX, gY, gW, gH, b, "F");
 
   // Bottom stats bar — verified column positions, min 7px between all items
   canvas.drawRect(8, 244, 384, 24, 1);
@@ -2227,7 +2790,8 @@ void drawHumidityGraphPage() {
   // Current value — FONT_LARGE fits header box without clipping
   canvas.setFont(&FONT_LARGE); canvas.setCursor(220, 38); canvas.print((int)humidity);
   canvas.setFont(&FONT_SMALL); canvas.print(" %");
-  int hTrend = calcTrend(history.humidityHistory, history.currentIndex, history.sampleCount);
+  int startIndex = historyStartIndex();
+  int hTrend = calcTrend(history.humidityHistory, startIndex, history.sampleCount);
   drawTrendArrow(375, 22, hTrend);
 
   if (history.sampleCount < 2) {
@@ -2237,10 +2801,12 @@ void drawHumidityGraphPage() {
   }
 
   int gX = 44, gY = 52, gW = 336, gH = 168;
-  GraphBounds b = calcGraphBounds(history.humidityHistory, HISTORY_SIZE, 10.0f, 2.0f);
+  GraphBounds b = calcGraphBounds(history.humidityHistory, startIndex,
+                                  history.sampleCount, 10.0f, 2.0f);
   if (b.mn < 0.0f) b.mn = 0.0f; if (b.mx > 100.0f) b.mx = 100.0f;
   b.rng = b.mx - b.mn; if (b.rng < 1.0f) b.rng = 1.0f;
-  drawEnhancedGraph(history.humidityHistory, history.currentIndex, min((int)history.sampleCount,(int)HISTORY_SIZE), gX, gY, gW, gH, b, "%");
+  drawEnhancedGraph(history.humidityHistory, startIndex, history.sampleCount,
+                    gX, gY, gW, gH, b, "%");
 
   // Bottom stats bar — verified column positions, min 7px between all items
   canvas.drawRect(8, 244, 384, 24, 1);
@@ -3012,7 +3578,7 @@ String buildSleepSection() {
          "padding:10px 14px;margin-bottom:10px;display:flex;align-items:center;"
          "justify-content:space-between;'>"
          "<span style='color:#39d98a;font-size:13px;'>&#128274; Display is sleeping</span>"
-         "<button class='btn' onclick=\"doAction('/wakenow','Waking...','Awake for 10 s')\">Wake Now</button>"
+         "<button class='btn' onclick=\"doAction('/wakenow','Waking...','Awake for 60 s')\">Wake Now</button>"
          "</div>";
   } else {
     s += "<div style='font-size:12px;color:var(--muted);margin-bottom:8px;'>Display is currently awake.</div>";
@@ -3570,9 +4136,9 @@ void handleSetSleep() {
   webServer.send(200, "text/plain", "ok");
 }
 
-// GET /wakenow — temporary 10 s wake from web UI (same as a button press)
+// GET /wakenow — temporary 60-second interactive wake from the web UI
 void handleWakeNow() {
-  sleepWakeUntil = millis() + 10000UL;
+  activateDisplayInteractiveWindow();
   webServer.send(200, "text/plain", "ok");
 }
 
@@ -4028,13 +4594,13 @@ void handleButtons() {
   unsigned long now = millis();
   bool btnLNow = (digitalRead(BTN_LEFT)   == LOW);
   bool btnMNow = (digitalRead(BTN_MIDDLE) == LOW);
+  bool newButtonPress =
+    (btnLNow && !btnLeftPrev) || (btnMNow && !btnMiddlePrev);
+  if (newButtonPress) activateDisplayInteractiveWindow();
 
-  // While display is sleeping, any button press wakes it for 10 seconds.
+  // While display is sleeping, any button press wakes it for 60 seconds.
   // No page changes or other actions are triggered during sleep.
   if (isDisplaySleeping()) {
-    if ((btnLNow && !btnLeftPrev) || (btnMNow && !btnMiddlePrev)) {
-      sleepWakeUntil = millis() + 10000UL;
-    }
     btnLeftPrev   = btnLNow;
     btnMiddlePrev = btnMNow;
     return;
@@ -4108,15 +4674,20 @@ void setup() {
   analogReadResolution(12);
   analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
   nvsLoad();
+  loadSensorComparisonState();
   updateBatteryState(readBatteryVoltage());
+  serviceUsbHostState(true);
   lastBatteryReadMs = millis();
   gpio_wakeup_enable((gpio_num_t)BTN_LEFT, GPIO_INTR_LOW_LEVEL);
   gpio_wakeup_enable((gpio_num_t)BTN_MIDDLE, GPIO_INTR_LOW_LEVEL);
   esp_sleep_enable_gpio_wakeup();
 
   Wire.begin(13, 14);
+  scanI2cBusAtStartup();
+  mountStorage();
   initAudio();
   RlcdPort.RLCD_Init();
+  displayHighPower = true;
   rtc.begin();
 
   canvas.fillScreen(0);
@@ -4165,17 +4736,17 @@ void setup() {
     bootLine--; drawBoot("Join SEN66-Setup", 1);
   }
 
+  serviceShtc3(true);
   if (senReady) {
     delay(1100);
     if (readSen66()) sensorReadCount++; else sensorFailCount++;
   }
   lastSensorReadMs = millis();
 
-  history.initialized=false; history.currentIndex=0; history.sampleCount=0; history.lastLogTime=millis();
-  for (int i=0;i<HISTORY_SIZE;i++) {
-    history.tempHistory[i]=cToF(temperature);
-    history.humidityHistory[i]=humidity;
-  }
+  loadHistory();
+  if (history.sampleCount == 0 && (indoor.valid || sensorComparison.shtc3Valid))
+    appendHistoryPoint(cToF(temperature), humidity);
+  serviceDisplayPowerMode();
   beepBootOk();
   Serial.println("Ready!");
   delay(500);
@@ -4184,7 +4755,9 @@ void setup() {
 void loop() {
   if (wifiConnected) webServer.handleClient();  // non-blocking — must be called every loop
 
+  serviceUsbHostState();
   handleButtons();
+  serviceDisplayPowerMode();
   // Read all RTC values in one pass to minimise I2C transactions
   hour24    = rtc.getHour();
   minuteVal = rtc.getMinute();
@@ -4194,6 +4767,7 @@ void loop() {
   unsigned long now = millis();
   serviceConnectivity();
   serviceSen66Power();
+  serviceShtc3();
   if (sen66MeasurementRunning && now - sen66StartedMs >= 1100UL &&
       now - lastSensorReadMs >= 1000UL) {
     lastSensorReadMs = now;
@@ -4207,6 +4781,7 @@ void loop() {
       Serial.print("SEN66 read failed");
     }
     if (wifiConnected) { wifiRSSI=WiFi.RSSI(); Serial.printf(" WiFi=%d",wifiRSSI); }
+    Serial.printf(" VBAT=%.3fV", batteryVoltage);
     Serial.println();
     serviceCo2Calibration();
   }
@@ -4224,14 +4799,8 @@ void loop() {
     }
   }
 
-  if (now - history.lastLogTime >= 900000UL) {
-    history.tempHistory[history.currentIndex]     = cToF(temperature);
-    history.humidityHistory[history.currentIndex] = humidity;
-    history.currentIndex = (history.currentIndex + 1) % HISTORY_SIZE;
-    history.lastLogTime  = now;
-    if (history.sampleCount < HISTORY_SIZE) history.sampleCount++;
-    history.initialized = (history.sampleCount >= HISTORY_SIZE);
-  }
+  if (now - history.lastLogTime >= HISTORY_UPDATE_MS)
+    appendHistoryPoint(cToF(temperature), humidity);
 
   // Web UI triggered actions (set by handlers, actioned here on main thread)
   if (webRefreshWeather) { webRefreshWeather = false; if (wifiConnected) fetchAllOnlineData(); }
@@ -4265,7 +4834,7 @@ void loop() {
 
   // Display sleep — skip all canvas draws when sleeping.
   // On first entry to sleep: show a brief "Going to sleep..." banner then stop.
-  // Button press (handled above in handleButtons) sets sleepWakeUntil for 10 s.
+  // Button press (handled above in handleButtons) sets a 60-second wake window.
   static bool wasSleeping = false;
   bool nowSleeping = isDisplaySleeping();
 
@@ -4283,9 +4852,12 @@ void loop() {
     canvas.fillScreen(0);
     pushCanvasToRLCD(false);
     RlcdPort.RLCD_Sleep();
+    displayHighPower = true;
   }
   if (wasSleeping && !nowSleeping) {
     RlcdPort.RLCD_Wake();
+    displayHighPower = true;
+    serviceDisplayPowerMode();
     lastDisplayUpdateMs = 0;
   }
   wasSleeping = nowSleeping;
@@ -4293,8 +4865,10 @@ void loop() {
   if (nowSleeping) {
     delay(100);   // idle — no SPI writes while sleeping
   } else {
+    unsigned long displayInterval =
+      displayHighPower ? DISPLAY_INTERACTIVE_UPDATE_MS : DISPLAY_UPDATE_MS;
     if (lastDisplayUpdateMs == 0 ||
-        now - lastDisplayUpdateMs >= DISPLAY_UPDATE_MS) {
+        now - lastDisplayUpdateMs >= displayInterval) {
       draw();
       lastDisplayUpdateMs = millis();
     }
@@ -4306,6 +4880,7 @@ void loop() {
     !alarmFiring && !timerFiring &&
     co2Calibration.state != CO2_CAL_STABILIZING &&
     co2Calibration.state != CO2_CAL_EXECUTING &&
+    !displayInteractive() &&
     digitalRead(BTN_LEFT) == HIGH && digitalRead(BTN_MIDDLE) == HIGH;
   if (canLightSleep) {
     esp_sleep_enable_timer_wakeup(200000ULL);

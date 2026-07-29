@@ -30,7 +30,30 @@ The main page reports:
 
 This is an application-level readiness indication. It does not certify that the sensor has completed every long-term conditioning or accuracy-stabilization interval described by Sensirion.
 
-## 3. Temperature and wind conversion
+## 3. SHTC3 comparison and fallback
+
+The firmware reads the onboard SHTC3 every 15 seconds.
+It calculates each paired delta as `SEN66 minus SHTC3`.
+It stores temperature and humidity pairs in `/sensor_compare.csv`.
+
+The initial model requires 12 elapsed hours and at least 100 paired samples.
+The firmware calculates the mean and standard deviation with Welford statistics.
+It caps model inputs at `+/-10 C` and `+/-30 percent RH`.
+It does not apply the learned offset before qualification.
+
+After qualification, the firmware uses a weighted rolling mean with an alpha value of `0.02`.
+It rejects a new paired delta when the delta exceeds one standard deviation from the current mean.
+The minimum gates are `0.10 C` for temperature and `1.00 percent RH` for humidity.
+
+The firmware uses the corrected SHTC3 values while the SEN66 is idle.
+It uses the SEN66 values while the SEN66 measures.
+The System Information page shows the mean temperature and humidity deltas.
+
+The firmware stores the model in NVS at one-hour intervals.
+It stores the paired measurement log in FATFS.
+It rotates the log after four MiB.
+
+## 4. Temperature and wind conversion
 
 All user-facing temperatures use:
 
@@ -46,7 +69,7 @@ mph = kph x 0.621371
 
 Precipitation remains in millimeters.
 
-## 4. Indoor particle AQI
+## 5. Indoor particle AQI
 
 The firmware implements the U.S. EPA PM2.5 breakpoints updated for 2024 and the standard PM10 breakpoints.
 
@@ -97,7 +120,7 @@ Reference sources:
 - [EPA 2024 PM AQI update fact sheet](https://www.epa.gov/system/files/documents/2024-02/pm-naaqs-air-quality-index-fact-sheet.pdf)
 - [EPA AQS AQI breakpoint reference table](https://aqs.epa.gov/aqsweb/documents/codetables/aqi_breakpoints.html)
 
-## 5. AQI limitation
+## 6. AQI limitation
 
 EPA AQI reporting is based on defined pollutant averaging, truncation, quality-control, and reporting procedures. The firmware applies breakpoint mathematics to the current sensor values. It does not maintain the regulatory 24-hour particulate average.
 
@@ -110,7 +133,7 @@ Accordingly:
 
 The main LCD keeps indoor and outdoor AQI separate. The web weather page retains an arithmetic combined view for convenience. that value has no EPA-defined meaning.
 
-## 6. Outdoor data
+## 7. Outdoor data
 
 The firmware requests:
 
@@ -135,11 +158,20 @@ Outdoor PM2.5 AQI is recalculated locally through the same PM2.5 interpolation r
 
 API schema reference: [WeatherAPI documentation](https://www.weatherapi.com/docs/).
 
-## 7. OpenWeather data
+## 8. OpenWeather data
 
 OpenWeather One Call 4.0 supplies up to 60 one-minute precipitation records.
 
 The firmware stores the precipitation rate and time for each record. The minute page shows these records as a bar chart.
+
+The 15-minute timeline supplies the first forecast temperature and rain probability.
+The page shows the first forecast temperature as `OUTSIDE`.
+The firmware also hashes active alert identifiers.
+
+A new rain event or a changed alert identifier selects the 60-minute page once.
+Manual navigation suppresses repeat selection for the same event.
+Dry conditions reset the rain-event latch.
+An empty alert list resets the alert latch.
 
 The Air Pollution API supplies outdoor PM2.5 and PM10 concentrations.
 
@@ -147,7 +179,7 @@ The firmware calculates U.S. particle AQI from both concentrations. It uses the 
 
 The OpenWeather `main.aqi` value uses a separate five-level scale. The firmware does not display that value as U.S. AQI.
 
-## 8. Coordinate-derived timezone and local clock
+## 9. Coordinate-derived timezone and local clock
 
 The same Forecast API response used for weather provides:
 
@@ -173,7 +205,7 @@ weather data and schedules a new request. A successful request updates weather,
 timezone, and RTC together. The API-provided sunrise and sunset strings are
 already local to the same resolved location.
 
-## 9. Pressure-assisted forced CO2 recalibration
+## 10. Pressure-assisted forced CO2 recalibration
 
 The web calibration workflow parses WeatherAPI `current.pressure_mb`, validates
 700-1200 hPa, rounds it to an integer hPa, and sends it through
@@ -197,14 +229,18 @@ qualification because pressure changes the CO2 measurement. The system cannot
 independently verify outdoor placement or establish a traceable reference-gas
 concentration.
 
-## 10. Hourly selection
+## 11. Hourly selection
 
 The parser scans up to 72 hourly records across the three forecast days. It selects the first six records with `time_epoch` later than the current system epoch. This allows the list to cross midnight rather than restarting at 00:00 or stopping at the end of the first forecast day.
 
 System time is preferred. WeatherAPI `localtime_epoch` is used as a fallback if system time is not valid.
 
-## 11. History buffers
+## 12. History storage
 
-Temperature and humidity histories contain 24 entries sampled every 15 minutes. At capacity, each graph represents six hours. History is RAM-resident and is reset at boot.
+Temperature and humidity histories contain 24 entries sampled every 15 minutes.
+At capacity, each graph represents six hours.
 
-The firmware seeds the arrays at startup so the graph has defined numeric content, but it does not claim those seeded entries are historical observations. Operational interpretation should begin after real samples have accumulated.
+The firmware stores the history in `/history.csv` on FATFS.
+It restores valid entries during boot.
+It removes entries older than six hours when it rewrites the file.
+Each update uses a temporary file before it replaces the active file.

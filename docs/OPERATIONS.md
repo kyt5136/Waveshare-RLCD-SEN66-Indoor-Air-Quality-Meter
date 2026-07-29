@@ -16,7 +16,7 @@ The 2026-07-29 reference build used:
 Arduino CLI validation target:
 
 ```powershell
-arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi" firmware/weather_dash
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,USBMode=hwcdc,CDCOnBoot=cdc" firmware/weather_dash
 ```
 
 The generic FQBN validation checks compilation. Deployment still requires the Waveshare-appropriate flash, PSRAM, USB, and partition selections in Arduino IDE.
@@ -50,6 +50,13 @@ Observe Serial Monitor at 115200 baud. Expected milestones:
 
 ```text
 ESP32-S3 SEN66 WEATHER STATION
+[I2C] Startup scan on SDA=GPIO13, SCL=GPIO14
+[I2C] 0x18 ES8311 audio codec - EXPECTED
+[I2C] 0x40 ES7210 microphone ADC - EXPECTED
+[I2C] 0x51 PCF85063A RTC - EXPECTED
+[I2C] 0x6B SEN66 external air-quality sensor - EXPECTED
+[I2C] 0x70 SHTC3 onboard temperature/humidity sensor - EXPECTED
+[I2C] Scan complete: 5 responder(s), 0 unknown
 SEN66 started
 WiFi connected
 Outdoor weather loaded
@@ -57,6 +64,9 @@ Location clock synced
 ```
 
 Exact wording may vary with state. Do not proceed directly to enclosure closure if the SEN66 probe, serial-number read, or continuous-measurement command fails.
+
+Investigate each `MISSING`, `UNKNOWN`, or `BUS ERROR` I2C line.
+An unknown address can indicate an added module or an address conflict.
 
 If the Wi-Fi connection fails, join `SEN66-Setup` from a phone. Use `sen66-setup` as the password.
 
@@ -68,8 +78,8 @@ Verify:
 2. Main page temperature is Fahrenheit.
 3. Outdoor wind uses mph.
 4. Hourly forecast starts with the next full hour.
-5. The 60-minute page shows OpenWeather precipitation data.
-6. The minute page also shows indoor CO2, temperature, and humidity.
+5. The 60-minute page shows the next outside temperature and precipitation data.
+6. The page shows inside temperature, humidity, CO2, the clock, and battery charge.
 7. Sunrise and sunset correspond to the configured WeatherAPI location.
 8. RTC survives a normal reset.
 9. The displayed IANA timezone and UTC offset match the configured coordinates.
@@ -81,7 +91,12 @@ Verify:
 14. GPIO 18 selects the next page.
 15. A short GPIO 0 press selects the previous page.
 16. A one-second GPIO 0 hold starts a five-minute Wi-Fi window.
-17. `secrets.h` remains untracked.
+17. Either button selects ST7305 high-power mode for 60 seconds.
+18. The display returns to 0.5 Hz low-power mode after the interaction window.
+19. Serial sensor lines show battery voltage with three decimal places.
+20. `/history.csv` restores the last six hours after a reset.
+21. The System Information page shows the SEN66-to-SHTC3 mean deltas.
+22. `secrets.h` remains untracked.
 
 ### Forced CO2 calibration
 

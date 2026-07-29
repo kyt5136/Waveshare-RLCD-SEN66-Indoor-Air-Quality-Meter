@@ -55,6 +55,7 @@ public:
   ~DisplayPort();
   
   void RLCD_Init();
+  void RLCD_SetPowerMode(bool highPower);
   void RLCD_Sleep();
   void RLCD_Wake();
   void RLCD_ColorClear(uint8_t color);
