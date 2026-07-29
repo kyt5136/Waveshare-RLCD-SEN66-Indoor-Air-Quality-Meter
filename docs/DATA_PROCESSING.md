@@ -24,8 +24,8 @@ VOC Index and NOx Index must not be labeled as ppm or ppb. They are processed in
 
 The main page reports:
 
-- `SEN66 WAITING` when no valid processed frame has been received;
-- `SEN66 ACTIVE / PREHEATING` when a frame exists but VOC, NOx, or CO2 is still invalid;
+- `SEN66 WAITING` when no valid processed frame has been received.
+- `SEN66 ACTIVE / PREHEATING` when a frame exists but VOC, NOx, or CO2 is still invalid.
 - `SEN66 ACTIVE / READY` when those processed values are populated.
 
 This is an application-level readiness indication. It does not certify that the sensor has completed every long-term conditioning or accuracy-stabilization interval described by Sensirion.
@@ -103,12 +103,12 @@ EPA AQI reporting is based on defined pollutant averaging, truncation, quality-c
 
 Accordingly:
 
-- the displayed value is useful for trend awareness and local control;
-- it must not be represented as an official AQI observation;
-- it is not a substitute for a regulatory monitor;
+- the displayed value is useful for trend awareness and local control.
+- it must not be represented as an official AQI observation.
+- it is not a substitute for a regulatory monitor.
 - it is not a medical or life-safety measurement.
 
-The main LCD keeps indoor and outdoor AQI separate. The web weather page retains an arithmetic combined view for convenience; that value has no EPA-defined meaning.
+The main LCD keeps indoor and outdoor AQI separate. The web weather page retains an arithmetic combined view for convenience. that value has no EPA-defined meaning.
 
 ## 6. Outdoor data
 
@@ -120,27 +120,39 @@ The firmware requests:
 
 It parses:
 
-- current temperature and feels-like temperature;
-- humidity;
-- condition text;
-- wind speed and direction;
-- precipitation;
-- UV index;
-- PM2.5 and WeatherAPI's U.S. EPA category;
-- three daily forecasts;
-- sunrise and sunset;
+- current temperature and feels-like temperature.
+- humidity.
+- condition text.
+- wind speed and direction.
+- precipitation.
+- UV index.
+- PM2.5 and WeatherAPI's U.S. EPA category.
+- three daily forecasts.
+- sunrise and sunset.
 - hourly forecast records.
 
 Outdoor PM2.5 AQI is recalculated locally through the same PM2.5 interpolation routine used indoors. It is not taken directly from the WeatherAPI category integer.
 
 API schema reference: [WeatherAPI documentation](https://www.weatherapi.com/docs/).
 
-## 7. Coordinate-derived timezone and local clock
+## 7. OpenWeather data
+
+OpenWeather One Call 4.0 supplies up to 60 one-minute precipitation records.
+
+The firmware stores the precipitation rate and time for each record. The minute page shows these records as a bar chart.
+
+The Air Pollution API supplies outdoor PM2.5 and PM10 concentrations.
+
+The firmware calculates U.S. particle AQI from both concentrations. It uses the higher sub-index as outdoor AQI.
+
+The OpenWeather `main.aqi` value uses a separate five-level scale. The firmware does not display that value as U.S. AQI.
+
+## 8. Coordinate-derived timezone and local clock
 
 The same Forecast API response used for weather provides:
 
-- `location.tz_id`;
-- `location.localtime_epoch`;
+- `location.tz_id`.
+- `location.localtime_epoch`.
 - `location.localtime`.
 
 The firmware interprets the local calendar fields against the returned epoch to
@@ -161,7 +173,7 @@ weather data and schedules a new request. A successful request updates weather,
 timezone, and RTC together. The API-provided sunrise and sunset strings are
 already local to the same resolved location.
 
-## 8. Pressure-assisted forced CO2 recalibration
+## 9. Pressure-assisted forced CO2 recalibration
 
 The web calibration workflow parses WeatherAPI `current.pressure_mb`, validates
 700-1200 hPa, rounds it to an integer hPa, and sends it through
@@ -185,13 +197,13 @@ qualification because pressure changes the CO2 measurement. The system cannot
 independently verify outdoor placement or establish a traceable reference-gas
 concentration.
 
-## 9. Hourly selection
+## 10. Hourly selection
 
 The parser scans up to 72 hourly records across the three forecast days. It selects the first six records with `time_epoch` later than the current system epoch. This allows the list to cross midnight rather than restarting at 00:00 or stopping at the end of the first forecast day.
 
 System time is preferred. WeatherAPI `localtime_epoch` is used as a fallback if system time is not valid.
 
-## 10. History buffers
+## 11. History buffers
 
 Temperature and humidity histories contain 24 entries sampled every 15 minutes. At capacity, each graph represents six hours. History is RAM-resident and is reset at boot.
 

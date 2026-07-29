@@ -23,9 +23,13 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <DNSServer.h>
 #include <time.h>
 #include <math.h>
 #include <Wire.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
 #include <SensirionI2cSen66.h>
 #include <SensirionCore.h>
 struct AqiBreakpoint;
@@ -59,6 +63,17 @@ const int BTN_MIDDLE  = 18;
 const int BAT_ADC_PIN = 4;
 static const uint8_t SEN66_ADDR = 0x6B;
 
+// Schematic R21/R23 divider: 200 kOhm / 100 kOhm, therefore VBAT = VADC * 3.
+// Leave this at 1.000 until a rested-cell reading is compared with a DMM.
+static constexpr float BATTERY_DIVIDER_RATIO = 3.0f;
+static constexpr float BATTERY_CALIBRATION = 1.000f;
+static constexpr float EXTERNAL_POWER_ENTER_V = 4.18f;
+static constexpr float EXTERNAL_POWER_EXIT_V = 4.12f;
+static constexpr unsigned long DISPLAY_UPDATE_MS = 2000UL;  // 0.5 Hz
+static constexpr unsigned long WIFI_NORMAL_MS = 1800000UL;
+static constexpr unsigned long WIFI_RAIN_MS = 600000UL;
+static constexpr unsigned long WIFI_MANUAL_WINDOW_MS = 300000UL;
+
 #define FONT_SMALL   FreeSans9pt7b
 #define FONT_MEDIUM  FreeSans12pt7b
 #define FONT_LARGE   FreeSans18pt7b
@@ -76,6 +91,10 @@ SensirionI2cSen66 sen66;
 float temperature    = 0.0f;
 float humidity       = 0.0f;
 float batteryVoltage = 0.0f;
+float batterySoc     = 0.0f;
+bool  batteryStateInitialized = false;
+bool  externalPowerLikely = false;
+bool  lowPowerMode   = false;
 int   wifiRSSI       = 0;
 int   hour24         = 0;
 int   minuteVal      = 0;
@@ -83,6 +102,7 @@ int   secondVal      = 0;
 bool  wifiConnected  = false;
 unsigned long lastSensorReadMs = 0;
 unsigned long lastBatteryReadMs = 0;
+unsigned long lastDisplayUpdateMs = 0;
 unsigned long ntpLastSync = 0;
 int   sensorReadCount     = 0;
 int   sensorFailCount     = 0;
@@ -92,7 +112,7 @@ static inline float cToF(float celsius) {
 }
 
 int  currentPage  = 0;
-const int totalPages = 13;
+const int totalPages = 14;
 const uint16_t ALL_PAGE_MASK = (1U << totalPages) - 1U;
 uint16_t pageEnabledMask = ALL_PAGE_MASK;
 char activeWeatherLocation[64] = "";
@@ -119,13 +139,58 @@ bool btn_left_pressed   = false;
 bool btn_middle_pressed = false;
 
 // Long-press navigation
-const unsigned long LONG_PRESS_MS = 700;
+const unsigned long LONG_PRESS_MS = 1000;
 unsigned long lastBtnLeftDown   = 0;
 unsigned long lastBtnMiddleDown = 0;
 bool btnLeftPrev    = true;
 bool btnMiddlePrev  = true;
 bool btnLeftHeld    = false;
 bool btnMiddleHeld  = false;
+
+// Runtime network state. Credentials from secrets.h are defaults; a provisioning
+// session can replace them in NVS without changing or publishing secrets.h.
+char activeSsid[33] = "";
+char activePassword[65] = "";
+bool webServerStarted = false;
+bool provisioningActive = false;
+unsigned long provisioningUntilMs = 0;
+unsigned long wifiWindowUntilMs = 0;
+unsigned long lastOnlineUpdateMs = 0;
+unsigned long lastOnlineAttemptMs = 0;
+DNSServer dnsServer;
+
+// SEN66 low-power duty-cycle and VOC baseline retention.
+bool sen66MeasurementRunning = false;
+unsigned long sen66StartedMs = 0;
+unsigned long lastVocStateSaveMs = 0;
+static constexpr uint16_t VOC_STATE_SIZE = 8;
+uint8_t savedVocState[VOC_STATE_SIZE] = {0};
+bool savedVocStateValid = false;
+
+// OpenWeather One Call 4.0 minute timeline and air-pollution results.
+struct OwmMinuteData {
+  float precipitation[60];
+  time_t epoch[60];
+  int count;
+  float maxPrecipitation;
+  bool rainNext30;
+  bool valid;
+  unsigned long lastUpdate;
+} owmMinute;
+unsigned long rainBoostUntilMs = 0;
+bool rainEventArmed = true;
+uint16_t owmCallsToday = 0;
+int owmCallDay = -1;
+
+// Voltage-derived state-of-charge trend. This is an estimate, not coulomb counting.
+struct BatteryTrendPoint {
+  float soc;
+  unsigned long atMs;
+};
+BatteryTrendPoint batteryTrend[48];
+int batteryTrendCount = 0;
+int batteryTrendHead = 0;
+unsigned long lastBatteryTrendMs = 0;
 
 unsigned long bootMillis     = 0;
 
@@ -446,13 +511,14 @@ static bool es8311InitPlayback() {
 
 bool initAudio() {
   pinMode(SPK_EN_PIN, OUTPUT);
-  digitalWrite(SPK_EN_PIN, HIGH);  // enable NS4150B amp
+  digitalWrite(SPK_EN_PIN, HIGH);  // enabled only during codec initialization
   delay(5);
   i2sAudio.setPins(I2S_BCLK_PIN, I2S_LRCLK_PIN, I2S_DOUT_PIN, -1, I2S_MCLK_PIN);
   audioReady = i2sAudio.begin(I2S_MODE_STD, 16000, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
   if (!audioReady) { Serial.println("[AUDIO] I2S init failed"); return false; }
   codecReady = es8311InitPlayback();
   if (!codecReady) { Serial.println("[AUDIO] ES8311 init failed"); return false; }
+  digitalWrite(SPK_EN_PIN, LOW);   // NS4150B shutdown between audible events
   return true;
 }
 
@@ -467,6 +533,8 @@ void audioSilenceMs(uint16_t ms) {
 // amp parameter is the base amplitude; scaled by beepVolume (1-100%)
 void playToneHz(uint16_t freq, uint16_t ms, int16_t amp = 2800) {
   if (!audioReady || !codecReady || freq < 20 || ms == 0) return;
+  digitalWrite(SPK_EN_PIN, HIGH);
+  delay(2);
   int vol = constrain(beepVolume, 1, 100);
   int16_t scaledAmp = (int16_t)((int)amp * vol / 100);
   if (scaledAmp < 100) scaledAmp = 100;  // floor so it's always audible
@@ -482,6 +550,7 @@ void playToneHz(uint16_t freq, uint16_t ms, int16_t amp = 2800) {
     frame[3] = frame[1];
     i2sAudio.write(frame, 4);
   }
+  digitalWrite(SPK_EN_PIN, LOW);
 }
 
 // Short click on page change (~45ms) — respects beepEnabled setting
@@ -543,7 +612,7 @@ void updateTimer() {
       timerFiring      = true;
       timerRepeatCount = 0;
       timerNextChimeMs = millis();
-      currentPage = 12;   // jump to timers page
+      currentPage = 13;   // jump to timers page
     }
   }
 }
@@ -585,7 +654,7 @@ void checkAlarms() {
     alarmNextChimeMs = millis();
     alarmSnoozeUntil = 0;
     alarmSnoozeIdx   = -1;
-    currentPage = 12;  // jump to timers/alarms page
+    currentPage = 13;  // jump to timers/alarms page
     return;
   }
   lastAlarmMinuteChecked = minuteKey;
@@ -614,7 +683,7 @@ void snoozeAlarm() {
   alarmSnoozeUntil = millis() + 300000UL;  // 5 minutes
   alarmRepeatCount = 0;
   alarmFiringIdx   = -1;
-  currentPage      = 12;  // stay on timers page to show snooze countdown
+  currentPage      = 13;  // stay on timers page to show snooze countdown
 }
 
 // Dismiss the firing timer
@@ -823,11 +892,19 @@ bool initSen66() {
   }
   strncpy(indoor.serialNumber, (const char*)serial, sizeof(indoor.serialNumber) - 1);
 
+  if (savedVocStateValid) {
+    error = sen66.setVocAlgorithmState(savedVocState, VOC_STATE_SIZE);
+    Serial.printf("[SEN66] VOC state restore: %s (%d)\n",
+                  error == NO_ERROR ? "OK" : "failed", error);
+  }
+
   error = sen66.startContinuousMeasurement();
   if (error != NO_ERROR) {
     Serial.printf("[SEN66] Start failed: %d\n", error);
     return false;
   }
+  sen66MeasurementRunning = true;
+  sen66StartedMs = millis();
   Serial.printf("[SEN66] Started, serial %s\n", indoor.serialNumber);
   return true;
 }
@@ -848,6 +925,73 @@ bool readSen66() {
   temperature = indoor.temperature;
   humidity = indoor.humidity;
   return true;
+}
+
+bool saveVocAlgorithmState(bool forceWrite = false) {
+  if (!sen66MeasurementRunning && !savedVocStateValid) return false;
+  uint8_t state[VOC_STATE_SIZE] = {0};
+  int16_t error = sen66.getVocAlgorithmState(state, VOC_STATE_SIZE);
+  if (error != NO_ERROR) {
+    Serial.printf("[SEN66] VOC state read failed: %d\n", error);
+    return false;
+  }
+  memcpy(savedVocState, state, VOC_STATE_SIZE);
+  savedVocStateValid = true;
+
+  // Limit flash wear to at most one persisted baseline per hour. Stop/start
+  // retains the state inside a powered SEN66, so more frequent writes add no value.
+  if (forceWrite || millis() - lastVocStateSaveMs >= 3600000UL) {
+    prefs.begin("dash", false);
+    prefs.putBytes("voc_state", savedVocState, VOC_STATE_SIZE);
+    prefs.end();
+    lastVocStateSaveMs = millis();
+    Serial.println("[SEN66] VOC learning state persisted (8 bytes).");
+  }
+  return true;
+}
+
+bool startSen66Measurement() {
+  if (sen66MeasurementRunning) return true;
+  int16_t error = sen66.startContinuousMeasurement();
+  if (error != NO_ERROR) {
+    Serial.printf("[SEN66] Duty-cycle start failed: %d\n", error);
+    return false;
+  }
+  sen66MeasurementRunning = true;
+  sen66StartedMs = millis();
+  Serial.println("[SEN66] Measurement started.");
+  return true;
+}
+
+bool stopSen66Measurement() {
+  if (!sen66MeasurementRunning) return true;
+  saveVocAlgorithmState(false);
+  int16_t error = sen66.stopMeasurement();
+  if (error != NO_ERROR) {
+    Serial.printf("[SEN66] Duty-cycle stop failed: %d\n", error);
+    return false;
+  }
+  sen66MeasurementRunning = false;
+  Serial.println("[SEN66] Measurement stopped; VOC state remains in the powered sensor.");
+  return true;
+}
+
+bool sen66ShouldRunNow() {
+  if (!lowPowerMode || co2Calibration.state == CO2_CAL_STABILIZING ||
+      co2Calibration.state == CO2_CAL_EXECUTING) return true;
+
+  // Full conditioning window from xx:50:00 through the top-of-hour update.
+  if (minuteVal >= 50) return true;
+
+  // Otherwise run for the first 90 seconds of each ten-minute slot.
+  int slotSeconds = (minuteVal % 10) * 60 + secondVal;
+  return slotSeconds < 90;
+}
+
+void serviceSen66Power() {
+  bool shouldRun = sen66ShouldRunNow();
+  if (shouldRun && !sen66MeasurementRunning) startSen66Measurement();
+  else if (!shouldRun && sen66MeasurementRunning) stopSen66Measurement();
 }
 
 const char* co2CalibrationStateName() {
@@ -886,6 +1030,7 @@ void executeCo2Calibration() {
     failCo2Calibration(message);
     return;
   }
+  sen66MeasurementRunning = false;
 
   // SEN6x datasheet requires at least 1400 ms in idle mode before FRC.
   delay(1500);
@@ -893,6 +1038,8 @@ void executeCo2Calibration() {
   int16_t frcError =
     sen66.performForcedCo2Recalibration(CO2_CAL_TARGET_PPM, correction);
   int16_t startError = sen66.startContinuousMeasurement();
+  sen66MeasurementRunning = (startError == NO_ERROR);
+  if (sen66MeasurementRunning) sen66StartedMs = millis();
   indoor.valid = false;
   lastSensorReadMs = millis();
 
@@ -952,8 +1099,72 @@ void serviceCo2Calibration() {
 
 // ===== BATTERY =====
 float readBatteryVoltage() {
-  int raw = analogRead(BAT_ADC_PIN);
-  return (raw / 4095.0f) * 3.3f * 3.0f * 1.079f;
+  // analogReadMilliVolts() uses the ESP32 ADC calibration data. Average 32
+  // readings and discard the extrema to suppress Wi-Fi/charger switching noise.
+  uint32_t sum = 0;
+  uint32_t lo = UINT32_MAX;
+  uint32_t hi = 0;
+  for (int i = 0; i < 32; i++) {
+    uint32_t mv = analogReadMilliVolts(BAT_ADC_PIN);
+    sum += mv;
+    lo = min(lo, mv);
+    hi = max(hi, mv);
+    delayMicroseconds(250);
+  }
+  float adcMv = (sum - lo - hi) / 30.0f;
+  return adcMv * BATTERY_DIVIDER_RATIO * BATTERY_CALIBRATION / 1000.0f;
+}
+
+float batteryVoltageToSoc(float volts) {
+  // Resting-voltage interpolation for a conventional 4.20 V Li-ion 18650.
+  // Values under load are intentionally smoothed elsewhere.
+  static const float v[] = {3.20f,3.40f,3.55f,3.65f,3.72f,3.78f,3.84f,3.90f,3.96f,4.05f,4.20f};
+  static const float p[] = {0,5,10,20,30,40,50,60,70,85,100};
+  if (volts <= v[0]) return 0.0f;
+  if (volts >= v[10]) return 100.0f;
+  for (int i = 1; i < 11; i++) {
+    if (volts <= v[i]) {
+      float f = (volts - v[i-1]) / (v[i] - v[i-1]);
+      return p[i-1] + f * (p[i] - p[i-1]);
+    }
+  }
+  return 0.0f;
+}
+
+void updateBatteryState(float measuredVoltage) {
+  batteryVoltage = measuredVoltage;
+  float instantSoc = batteryVoltageToSoc(measuredVoltage);
+  batterySoc = batteryStateInitialized ?
+               batterySoc * 0.90f + instantSoc * 0.10f : instantSoc;
+  batteryStateInitialized = true;
+
+  // Hysteresis prevents Wi-Fi and SEN66 load steps from rapidly changing modes.
+  if (!externalPowerLikely && measuredVoltage >= EXTERNAL_POWER_ENTER_V)
+    externalPowerLikely = true;
+  else if (externalPowerLikely && measuredVoltage <= EXTERNAL_POWER_EXIT_V)
+    externalPowerLikely = false;
+  lowPowerMode = !externalPowerLikely;
+}
+
+void logBatteryTrend() {
+  if (lastBatteryTrendMs != 0 && millis() - lastBatteryTrendMs < 1800000UL) return;
+  lastBatteryTrendMs = millis();
+  batteryTrend[batteryTrendHead] = {batterySoc, millis()};
+  batteryTrendHead = (batteryTrendHead + 1) % 48;
+  if (batteryTrendCount < 48) batteryTrendCount++;
+}
+
+float estimatedHoursTo20Percent() {
+  if (externalPowerLikely || batterySoc <= 20.0f || batteryTrendCount < 5) return NAN;
+  int oldest = (batteryTrendHead - batteryTrendCount + 48) % 48;
+  const BatteryTrendPoint& first = batteryTrend[oldest];
+  const BatteryTrendPoint& last =
+    batteryTrend[(batteryTrendHead - 1 + 48) % 48];
+  float hours = (last.atMs - first.atMs) / 3600000.0f;
+  if (hours < 2.0f) return NAN;
+  float dropPerHour = (first.soc - last.soc) / hours;
+  if (dropPerHour <= 0.05f) return NAN;
+  return (batterySoc - 20.0f) / dropPerHour;
 }
 
 // Returns true if the display should currently be sleeping.
@@ -1136,6 +1347,137 @@ bool fetchWeatherData() {
   return true;
 }
 
+bool activeCoordinates(float& latitude, float& longitude) {
+  String value(activeWeatherLocation);
+  int comma = value.indexOf(',');
+  if (comma <= 0) return false;
+  char* latEnd = nullptr;
+  char* lonEnd = nullptr;
+  latitude = strtof(value.substring(0, comma).c_str(), &latEnd);
+  longitude = strtof(value.substring(comma + 1).c_str(), &lonEnd);
+  return latEnd && *latEnd == '\0' && lonEnd && *lonEnd == '\0' &&
+         latitude >= -90.0f && latitude <= 90.0f &&
+         longitude >= -180.0f && longitude <= 180.0f;
+}
+
+bool consumeOwmCallBudget() {
+  int today = rtc.getDay();
+  if (today != owmCallDay) {
+    owmCallDay = today;
+    owmCallsToday = 0;
+  }
+  // Leave a deliberate 10% safety margin below the user's 1,000-call ceiling.
+  if (owmCallsToday >= 900) return false;
+  owmCallsToday++;
+  return true;
+}
+
+bool fetchOpenWeatherMapData() {
+  if (!wifiConnected || strlen(OpenWeatherMapApiKey) < 8) return false;
+  float lat = 0.0f, lon = 0.0f;
+  if (!activeCoordinates(lat, lon)) {
+    Serial.println("[OWM] Location must be decimal latitude,longitude.");
+    return false;
+  }
+
+  bool minuteOk = false;
+  if (consumeOwmCallBudget()) {
+    HTTPClient http;
+    String url = "https://api.openweathermap.org/data/4.0/onecall/timeline/1min?lat=" +
+                 String(lat, 6) + "&lon=" + String(lon, 6) +
+                 "&appid=" + String(OpenWeatherMapApiKey);
+    http.begin(url);
+    http.setTimeout(15000);
+    int code = http.GET();
+    if (code == 200) {
+      JsonDocument filter;
+      filter["data"][0]["dt"] = true;
+      filter["data"][0]["precipitation"] = true;
+      JsonDocument doc;
+      DeserializationError error =
+        deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+      if (!error) {
+        owmMinute.count = 0;
+        owmMinute.maxPrecipitation = 0.0f;
+        owmMinute.rainNext30 = false;
+        for (JsonObject item : doc["data"].as<JsonArray>()) {
+          if (owmMinute.count >= 60) break;
+          int i = owmMinute.count++;
+          owmMinute.epoch[i] = item["dt"] | 0;
+          owmMinute.precipitation[i] = item["precipitation"] | 0.0f;
+          owmMinute.maxPrecipitation =
+            max(owmMinute.maxPrecipitation, owmMinute.precipitation[i]);
+          if (i < 30 && owmMinute.precipitation[i] > 0.01f)
+            owmMinute.rainNext30 = true;
+        }
+        minuteOk = owmMinute.count > 0;
+        owmMinute.valid = minuteOk;
+        if (minuteOk) owmMinute.lastUpdate = millis();
+      } else {
+        Serial.printf("[OWM] Minute JSON error: %s\n", error.c_str());
+      }
+    } else {
+      Serial.printf("[OWM] Minute request HTTP %d\n", code);
+    }
+    http.end();
+  }
+
+  bool airOk = false;
+  if (consumeOwmCallBudget()) {
+    HTTPClient http;
+    String url = "https://api.openweathermap.org/data/2.5/air_pollution?lat=" +
+                 String(lat, 6) + "&lon=" + String(lon, 6) +
+                 "&appid=" + String(OpenWeatherMapApiKey);
+    http.begin(url);
+    http.setTimeout(15000);
+    int code = http.GET();
+    if (code == 200) {
+      JsonDocument filter;
+      filter["list"][0]["main"]["aqi"] = true;
+      filter["list"][0]["components"]["pm2_5"] = true;
+      filter["list"][0]["components"]["pm10"] = true;
+      JsonDocument doc;
+      DeserializationError error =
+        deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+      if (!error && !doc["list"][0].isNull()) {
+        float pm25 = doc["list"][0]["components"]["pm2_5"] | 0.0f;
+        float pm10 = doc["list"][0]["components"]["pm10"] | 0.0f;
+        weatherData.pm25 = pm25;
+        weatherData.pmAqi = max(pm25ToAqi(pm25), pm10ToAqi(pm10));
+        weatherData.airQualityIndex = doc["list"][0]["main"]["aqi"] | 0;
+        airOk = true;
+      } else {
+        Serial.printf("[OWM] Air JSON error: %s\n", error.c_str());
+      }
+    } else {
+      Serial.printf("[OWM] Air request HTTP %d\n", code);
+    }
+    http.end();
+  }
+
+  if (minuteOk) {
+    if (owmMinute.rainNext30 && rainEventArmed) {
+      rainBoostUntilMs = millis() + 7200000UL;
+      rainEventArmed = false;
+      Serial.println("[OWM] Rain in next 30 minutes; 10-minute updates enabled for two hours.");
+    } else if (!owmMinute.rainNext30) {
+      rainEventArmed = true;
+      rainBoostUntilMs = 0;
+    }
+  }
+  Serial.printf("[OWM] Minute=%s air=%s calls today=%u\n",
+                minuteOk ? "OK" : "failed", airOk ? "OK" : "failed",
+                owmCallsToday);
+  return minuteOk || airOk;
+}
+
+bool fetchAllOnlineData() {
+  bool weatherOk = fetchWeatherData();
+  bool owmOk = fetchOpenWeatherMapData();
+  if (weatherOk || owmOk) lastOnlineUpdateMs = millis();
+  return weatherOk || owmOk;
+}
+
 // ===== DISPLAY HELPERS =====
 void pushCanvasToRLCD(bool invert = false) {
   uint8_t *buf = canvas.getBuffer();
@@ -1253,8 +1595,9 @@ void drawDashboardPage() {
   } else {
     canvas.print("SEN66 ACTIVE / READY");
   }
-  canvas.setCursor(267, 280);
-  canvas.print(batteryVoltage, 1); canvas.print("V");
+  canvas.setCursor(244, 280);
+  canvas.print(batteryVoltage, 2); canvas.print("V ");
+  canvas.print((int)lroundf(batterySoc)); canvas.print("%");
   drawWiFiIcon(350, 265, wifiRSSI);
 
   pushCanvasToRLCD(displayInvert);
@@ -1376,8 +1719,8 @@ void drawAnalogClockPage() {
     rtc.getDay(), rtc.getMonth(), rtc.getYear()%100);
   canvas.setCursor(14, 290); canvas.print(dateBuf);
   // Temp/humidity/battery right-aligned
-  char infoBuf[24];
-  snprintf(infoBuf, sizeof(infoBuf), "%.1fF  %d%%  %.1fV",
+  char infoBuf[28];
+  snprintf(infoBuf, sizeof(infoBuf), "%.1fF  %d%%  %.2fV",
     cToF(temperature), (int)humidity, batteryVoltage);
   int16_t ix1, iy1; uint16_t itw, ith;
   canvas.getTextBounds(infoBuf, 0, 290, &ix1, &iy1, &itw, &ith);
@@ -1615,7 +1958,7 @@ void drawSystemPage() {
     unsigned long syncAgo = (millis() - ntpLastSync) / 60000;
     ntpStr = syncAgo < 60 ? String(syncAgo) + " min ago" : String(syncAgo/60) + " hr ago";
   }
-  String ssidStr = wifiConnected ? String(ssid) : "--";
+  String ssidStr = wifiConnected ? String(activeSsid) : "--";
   if (ssidStr.length() > 20) ssidStr = ssidStr.substring(0, 20); // FONT_SMALL safe up to ~26 chars
   String chanStr  = wifiConnected ? String(WiFi.channel()) : "--";
   int total = sensorReadCount + sensorFailCount;
@@ -1634,6 +1977,11 @@ void drawSystemPage() {
   drawDetail(rx, gy, "SENSOR READS", readsStr);
 
   canvas.fillRect(8, 264, 384, 2, 1);
+  canvas.setFont(&FONT_SMALL); canvas.setCursor(12, 287);
+  canvas.print("BATTERY ");
+  canvas.print(batteryVoltage, 3); canvas.print(" V  ");
+  canvas.print((int)lroundf(batterySoc)); canvas.print("%  ");
+  canvas.print(lowPowerMode ? "LOW POWER" : "EXTERNAL POWER");
   pushCanvasToRLCD(displayInvert);
 }
 
@@ -1715,6 +2063,61 @@ void drawHourlyPage() {
   canvas.print("Upd ");
   if (weatherData.valid) { canvas.print((millis() - weatherData.lastUpdate) / 60000); canvas.print("m ago"); }
   else { canvas.print("--"); }
+  pushCanvasToRLCD(displayInvert);
+}
+
+// ===== PAGE 5: OPENWEATHER 60-MINUTE PRECIPITATION =====
+void drawMinuteCastPage() {
+  canvas.fillScreen(0);
+  canvas.drawRect(0, 0, W, H, 1); canvas.drawRect(1, 1, W-2, H-2, 1);
+  canvas.fillRect(8, 8, 384, 26, 1);
+  canvas.setTextColor(0); canvas.setFont(&FONT_SMALL);
+  canvas.setCursor(15, 27); canvas.print("NEXT 60 MINUTES - OPENWEATHER");
+  canvas.setTextColor(1);
+
+  const int boxY = 42, boxH = 58, boxW = 122;
+  const char* labels[] = {"INDOOR TEMP", "HUMIDITY", "CO2"};
+  for (int i = 0; i < 3; i++) {
+    int x = 8 + i * 131;
+    canvas.drawRect(x, boxY, boxW, boxH, 1);
+    canvas.setFont(&FONT_SMALL); canvas.setCursor(x + 7, boxY + 18);
+    canvas.print(labels[i]);
+    canvas.setFont(&FONT_MEDIUM); canvas.setCursor(x + 7, boxY + 46);
+    if (!indoor.valid) canvas.print("--");
+    else if (i == 0) { canvas.print(cToF(indoor.temperature), 1); canvas.print(" F"); }
+    else if (i == 1) { canvas.print(indoor.humidity, 0); canvas.print(" %"); }
+    else if (indoor.co2 != 0xFFFF) { canvas.print(indoor.co2); canvas.print(" ppm"); }
+    else canvas.print("--");
+  }
+
+  const int gx = 24, gy = 126, gw = 352, gh = 120;
+  canvas.drawRect(gx, gy, gw, gh, 1);
+  canvas.setFont(&FONT_SMALL);
+  if (!owmMinute.valid || owmMinute.count == 0) {
+    canvas.setCursor(84, 190); canvas.print("NO MINUTE FORECAST DATA");
+  } else {
+    float scaleMax = max(0.10f, owmMinute.maxPrecipitation);
+    for (int i = 0; i < owmMinute.count; i++) {
+      int x = gx + 2 + (i * (gw - 4)) / 60;
+      int nextX = gx + 2 + ((i + 1) * (gw - 4)) / 60;
+      int bw = max(1, nextX - x);
+      int bh = (int)lroundf((owmMinute.precipitation[i] / scaleMax) * (gh - 20));
+      if (bh > 0) canvas.fillRect(x, gy + gh - 2 - bh, bw, bh, 1);
+    }
+    canvas.setCursor(gx, gy - 6); canvas.print(scaleMax, 1); canvas.print(" mm/h");
+    for (int m = 0; m <= 60; m += 10) {
+      int x = gx + (m * gw) / 60;
+      canvas.drawLine(x, gy + gh, x, gy + gh + 4, 1);
+      canvas.setCursor(constrain(x - 7, 4, 370), gy + gh + 18);
+      canvas.print(m);
+    }
+    canvas.setCursor(171, 284); canvas.print("minutes");
+  }
+
+  canvas.setCursor(12, 284);
+  if (owmMinute.valid) {
+    canvas.print(owmMinute.rainNext30 ? "RAIN <30M" : "DRY <30M");
+  } else canvas.print("OWM OFFLINE");
   pushCanvasToRLCD(displayInvert);
 }
 
@@ -2354,21 +2757,27 @@ void draw() {
     case 2:  drawTimeZonePage();        break;
     case 3:  drawCurrentWeatherPage();  break;
     case 4:  drawHourlyPage();          break;
-    case 5:  drawForecastPage();        break;
-    case 6:  drawSeasonsPage();         break;
-    case 7:  drawSeasonsOrbitPage();    break;
-    case 8:  drawTempGraphPage();       break;
-    case 9:  drawHumidityGraphPage();   break;
-    case 10: drawSystemPage();           break;
-    case 11: drawSen66DetailsPage();     break;
-    case 12: drawTimersPage();           break;
+    case 5:  drawMinuteCastPage();       break;
+    case 6:  drawForecastPage();         break;
+    case 7:  drawSeasonsPage();          break;
+    case 8:  drawSeasonsOrbitPage();     break;
+    case 9:  drawTempGraphPage();        break;
+    case 10: drawHumidityGraphPage();    break;
+    case 11: drawSystemPage();           break;
+    case 12: drawSen66DetailsPage();     break;
+    case 13: drawTimersPage();           break;
   }
 }
 
 // ===== WIFI & NTP =====
 void connectWiFi() {
-  Serial.print("Connecting: "); Serial.println(ssid);
-  WiFi.begin(ssid, password);
+  if (strlen(activeSsid) == 0) {
+    wifiConnected = false;
+    return;
+  }
+  Serial.print("Connecting: "); Serial.println(activeSsid);
+  WiFi.mode(provisioningActive ? WIFI_AP_STA : WIFI_STA);
+  WiFi.begin(activeSsid, activePassword);
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(500); Serial.print("."); attempts++; }
   if (WiFi.status() == WL_CONNECTED) {
@@ -2411,6 +2820,7 @@ void nvsSave() {
   prefs.putBool("cycle_en",  autoCycleEnabled);
   prefs.putInt ("cycle_sec", autoCycleSeconds);
   prefs.putUShort("page_mask", pageEnabledMask);
+  prefs.putUChar("page_schema", 2);
   prefs.putBool("sleep_en",   sleepEnabled);
   prefs.putInt ("sleep_from", sleepFromHour);
   prefs.putInt ("sleep_to",   sleepToHour);
@@ -2438,7 +2848,16 @@ void nvsLoad() {
   beepVolume       = prefs.getInt ("beep_vol",  50);
   autoCycleEnabled = prefs.getBool("cycle_en",  false);
   autoCycleSeconds = prefs.getInt ("cycle_sec", 10);
-  pageEnabledMask = prefs.getUShort("page_mask", ALL_PAGE_MASK) & ALL_PAGE_MASK;
+  uint16_t storedMask = prefs.getUShort("page_mask", ALL_PAGE_MASK);
+  uint8_t pageSchema = prefs.getUChar("page_schema", 1);
+  if (pageSchema < 2) {
+    // Schema 2 inserts the minute forecast at page 5.
+    pageEnabledMask = (storedMask & 0x001FU) |
+                      ((storedMask & 0x1FE0U) << 1) | (1U << 5);
+  } else {
+    pageEnabledMask = storedMask;
+  }
+  pageEnabledMask &= ALL_PAGE_MASK;
   if (pageEnabledMask == 0) pageEnabledMask = ALL_PAGE_MASK;
   sleepEnabled  = prefs.getBool("sleep_en",   false);
   sleepFromHour = prefs.getInt ("sleep_from", 23);
@@ -2448,6 +2867,14 @@ void nvsLoad() {
   String savedTimezoneId = prefs.getString("tz_id", "UTC");
   savedTimezoneId.toCharArray(activeTimezoneId, sizeof(activeTimezoneId));
   gmtOffset_sec = prefs.getLong("tz_off", 0);
+  String savedSsid = prefs.getString("wifi_ssid", ssid);
+  String savedPassword = prefs.getString("wifi_pass", password);
+  savedSsid.toCharArray(activeSsid, sizeof(activeSsid));
+  savedPassword.toCharArray(activePassword, sizeof(activePassword));
+  if (prefs.getBytesLength("voc_state") == VOC_STATE_SIZE) {
+    prefs.getBytes("voc_state", savedVocState, VOC_STATE_SIZE);
+    savedVocStateValid = true;
+  }
   // Alarms — defaults: disabled, 07:00, one-shot, blank label
   for (int i = 0; i < ALARM_COUNT; i++) {
     char k[16];
@@ -2474,6 +2901,7 @@ void nvsLoad() {
   swState.startMs = 0;
   prefs.end();
   configureFixedOffsetTimezone(gmtOffset_sec);
+  if (pageSchema < 2) nvsSave();
 }
 
 // Minimal CSS shared across all pages
@@ -2532,7 +2960,7 @@ void webRedirect() {
 String buildPageGrid() {
   static const char* names[totalPages] = {
     "Indoor Air","Analog Clock","North America Time Zones","Outdoor Conditions",
-    "Hourly Forecast","3-Day Forecast","Seasons","Season Orbit",
+    "Hourly Forecast","60-Minute Rain","3-Day Forecast","Seasons","Season Orbit",
     "Temperature History","Humidity History","System Info","SEN66 Details","Timers"
   };
   String out = "<div class='pgrid'>";
@@ -2632,6 +3060,10 @@ String metric(const char* label, const String& value) {
 
 // GET / â€” control and live indoor summary
 void handleRoot() {
+  float hoursTo20 = estimatedHoursTo20Percent();
+  String runtimeEstimate = isnan(hoursTo20) ? "Learning" :
+    (hoursTo20 < 48.0f ? String(hoursTo20, 1) + " hours" :
+                         String(hoursTo20 / 24.0f, 1) + " days");
   String html = "<!doctype html><html><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>Indoor Weather Station</title>" + String(kCSS) + "</head><body><div class='w'>" +
@@ -2644,6 +3076,13 @@ void handleRoot() {
     metric("Indoor particle AQI", indoor.valid ? String(indoor.particleAqi)+" - "+aqiCategory(indoor.particleAqi) : "--") +
     metric("Outdoor PM2.5 AQI", weatherData.valid ? String(weatherData.pmAqi)+" - "+aqiCategory(weatherData.pmAqi) : "--") +
     "</div></div>"
+    "<div class='card'><h2>Battery Estimate</h2><div class='row'>" +
+    metric("Battery voltage", String(batteryVoltage, 2)+" V") +
+    metric("Estimated charge", String((int)lroundf(batterySoc))+"%") +
+    metric("Power mode", lowPowerMode ? "Low power" : "External power") +
+    metric("Estimated time to 20%", runtimeEstimate) +
+    "</div><div class='k'>The runtime value uses the measured voltage trend. "
+    "The board has no current monitor, so this value is not a coulomb-counted result.</div></div>"
     "<div class='card'><h2>Particle detail</h2><div class='row'>" +
     metric("Indoor PM2.5", indoor.valid ? String(indoor.pm25,1)+" ug/m3" : "--") +
     metric("Indoor PM10", indoor.valid ? String(indoor.pm10,1)+" ug/m3" : "--") +
@@ -2651,7 +3090,7 @@ void handleRoot() {
     metric("Outdoor PM2.5 AQI", weatherData.valid ? String(weatherData.pmAqi) : "--") +
     "</div></div>"
     "<div class='card'><h2>Actions</h2><div class='row'>"
-    "<button class='btn' onclick=\"fetch('/refresh').then(()=>location.reload())\">Refresh Weather</button>"
+    "<button class='btn' onclick=\"fetch('/refresh').then(()=>location.reload())\">Refresh Weather and Air</button>"
     "<button class='btn sec' onclick=\"fetch('/syncntp').then(()=>location.reload())\">Sync NTP</button>"
     "<a class='btn sec' href='/timers'>Timers</a></div></div>"
     "<div class='card'><h2>Outdoor SEN66 CO2 Calibration</h2>"
@@ -2809,6 +3248,7 @@ void handleSetPage() {
     int p = webServer.arg("p").toInt();
     if (p >= 0 && p < totalPages) {
       currentPage = p;
+      lastDisplayUpdateMs = 0;
       webPageBeep = true;  // trigger beep on main thread
     }
   }
@@ -2926,6 +3366,8 @@ void handleSetWeatherLocation() {
   weatherData.valid = false;
   weatherData.lastUpdate = 0;
   hourlyData.valid = false;
+  owmMinute.valid = false;
+  lastOnlineAttemptMs = 0;
   webRefreshWeather = true;
   nvsSave();
   webServer.send(200, "text/plain", "ok");
@@ -3400,8 +3842,87 @@ void handleTimers() {
   webServer.send(200, "text/html; charset=utf-8", html);
 }
 
+void handleProvisioningPage() {
+  String html = "<!doctype html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>SEN66 Setup</title>" + String(kCSS) + "</head><body><div class='w'>"
+    "<div class='card'><h1>SEN66 Network Setup</h1>"
+    "<div class='k'>This temporary setup network closes after ten minutes. "
+    "Enter Wi-Fi credentials and decimal coordinates. Browser location requires "
+    "permission and may be blocked on this local HTTP page; manual coordinates always work.</div>"
+    "<form method='post' action='/savewifi'>"
+    "<div class='row' style='margin-top:14px'><label class='kv'>"
+    "<div class='k'>Wi-Fi SSID</div><input type='text' name='ssid' maxlength='32' required></label></div>"
+    "<div class='row'><label class='kv'><div class='k'>Wi-Fi password</div>"
+    "<input type='password' name='pass' maxlength='64'></label></div>"
+    "<div class='row'><label class='kv'><div class='k'>Latitude</div>"
+    "<input type='text' id='lat' name='lat' maxlength='16' required></label>"
+    "<label class='kv'><div class='k'>Longitude</div>"
+    "<input type='text' id='lon' name='lon' maxlength='16' required></label></div>"
+    "<div class='row'><button type='button' class='btn sec' onclick='locate()'>Use Phone Location</button>"
+    "<button type='submit' class='btn'>Save and Restart</button></div>"
+    "<div id='status' class='k'></div></form></div>"
+    "<script>function locate(){let s=document.getElementById('status');"
+    "if(!navigator.geolocation){s.textContent='Geolocation is unavailable; enter coordinates manually.';return;}"
+    "s.textContent='Requesting browser location permission...';"
+    "navigator.geolocation.getCurrentPosition(p=>{lat.value=p.coords.latitude.toFixed(6);"
+    "lon.value=p.coords.longitude.toFixed(6);s.textContent='Location filled in.'},"
+    "e=>s.textContent='Location unavailable: '+e.message+'. Enter coordinates manually.',"
+    "{enableHighAccuracy:true,timeout:15000})}</script></div></body></html>";
+  webServer.send(200, "text/html; charset=utf-8", html);
+}
+
+void handleSaveWifi() {
+  String newSsid = webServer.arg("ssid");
+  String newPass = webServer.arg("pass");
+  String latText = webServer.arg("lat");
+  String lonText = webServer.arg("lon");
+  newSsid.trim(); latText.trim(); lonText.trim();
+  char* latEnd = nullptr;
+  char* lonEnd = nullptr;
+  float lat = strtof(latText.c_str(), &latEnd);
+  float lon = strtof(lonText.c_str(), &lonEnd);
+  if (newSsid.length() == 0 || newSsid.length() > 32 ||
+      newPass.length() > 64 || !latEnd || *latEnd != '\0' ||
+      !lonEnd || *lonEnd != '\0' || lat < -90.0f || lat > 90.0f ||
+      lon < -180.0f || lon > 180.0f) {
+    webServer.send(400, "text/plain", "Invalid SSID, password, or coordinates.");
+    return;
+  }
+  String location = String(lat, 6) + "," + String(lon, 6);
+  prefs.begin("dash", false);
+  prefs.putString("wifi_ssid", newSsid);
+  prefs.putString("wifi_pass", newPass);
+  prefs.putString("weather_loc", location);
+  prefs.end();
+  webServer.send(200, "text/html; charset=utf-8",
+                 "<html><body><h2>Saved. The station is restarting.</h2></body></html>");
+  delay(500);
+  ESP.restart();
+}
+
+void startProvisioningPortal() {
+  provisioningActive = true;
+  provisioningUntilMs = millis() + 600000UL;
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP("SEN66-Setup", "sen66-setup");
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  Serial.print("[WIFI] Setup portal: http://");
+  Serial.println(WiFi.softAPIP());
+  startWebServer();
+}
+
 void startWebServer() {
-  webServer.on("/",            handleRoot);
+  if (webServerStarted) {
+    webServer.begin();
+    return;
+  }
+  webServer.on("/", []() {
+    if (provisioningActive) handleProvisioningPage();
+    else handleRoot();
+  });
+  webServer.on("/setup",        handleProvisioningPage);
+  webServer.on("/savewifi", HTTP_POST, handleSaveWifi);
   webServer.on("/weather",     handleWeather);
   webServer.on("/seasons",     handleSeasons);
   webServer.on("/timers",      handleTimers);
@@ -3432,9 +3953,75 @@ void startWebServer() {
   webServer.on("/settimer",      handleSetTimer);
   webServer.on("/setalarm",      handleSetAlarm);
   webServer.on("/timerstate",    handleTimerState);
-  webServer.onNotFound([]() { webServer.sendHeader("Location","/"); webServer.send(303,"text/plain",""); });
+  webServer.onNotFound([]() {
+    webServer.sendHeader("Location", provisioningActive ? "/setup" : "/");
+    webServer.send(303,"text/plain","");
+  });
   webServer.begin();
-  Serial.print("[WEB] Serving at http://"); Serial.println(WiFi.localIP());
+  webServerStarted = true;
+  Serial.print("[WEB] Serving at http://");
+  Serial.println(provisioningActive ? WiFi.softAPIP() : WiFi.localIP());
+}
+
+void requestWifiWindow(unsigned long durationMs = WIFI_MANUAL_WINDOW_MS) {
+  wifiWindowUntilMs = max(wifiWindowUntilMs, millis() + durationMs);
+  if (!wifiConnected) connectWiFi();
+  if (wifiConnected) {
+    startWebServer();
+    Serial.printf("[WIFI] On-demand window open for %lu seconds at http://%s\n",
+                  durationMs / 1000UL, WiFi.localIP().toString().c_str());
+  }
+}
+
+void stopStationWifi() {
+  if (!wifiConnected || provisioningActive) return;
+  webServer.stop();
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
+  wifiConnected = false;
+  wifiRSSI = 0;
+  Serial.println("[WIFI] Radio disabled for low-power interval.");
+}
+
+void serviceConnectivity() {
+  unsigned long now = millis();
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
+
+  if (provisioningActive) {
+    dnsServer.processNextRequest();
+    webServer.handleClient();
+    if ((long)(now - provisioningUntilMs) >= 0) {
+      dnsServer.stop();
+      WiFi.softAPdisconnect(true);
+      provisioningActive = false;
+      if (!wifiConnected) WiFi.mode(WIFI_OFF);
+      Serial.println("[WIFI] Ten-minute setup window closed.");
+    }
+    return;
+  }
+
+  unsigned long interval =
+    ((long)(rainBoostUntilMs - now) > 0) ? WIFI_RAIN_MS : WIFI_NORMAL_MS;
+  bool onlineUpdateDue =
+    lastOnlineAttemptMs == 0 || now - lastOnlineAttemptMs >= interval;
+
+  if (onlineUpdateDue) {
+    lastOnlineAttemptMs = now;
+    if (!wifiConnected) connectWiFi();
+    if (wifiConnected) {
+      startWebServer();
+      fetchAllOnlineData();
+      if (ntpLastSync == 0 || now - ntpLastSync > 86400000UL) syncRTCWithNTP();
+      if (lowPowerMode) wifiWindowUntilMs = max(wifiWindowUntilMs, millis() + 30000UL);
+    }
+  }
+
+  if (wifiConnected) {
+    wifiRSSI = WiFi.RSSI();
+    webServer.handleClient();
+  }
+  if (lowPowerMode && wifiConnected && (long)(now - wifiWindowUntilMs) >= 0)
+    stopStationWifi();
 }
 
 void handleButtons() {
@@ -3453,8 +4040,8 @@ void handleButtons() {
     return;
   }
 
-  // BTN_LEFT: short press = next page, long press = previous page
-  // When alarm/timer firing: short press = snooze, long press = dismiss
+  // GPIO0/BOOT: short press = previous page; hold >=1 s = five-minute Wi-Fi window.
+  // During an alarm/timer, the established snooze/dismiss actions take priority.
   if (btnLNow && !btnLeftPrev)  { lastBtnLeftDown = now; btnLeftHeld = false; }
   if (btnLNow && btnLeftPrev && !btnLeftHeld && (now - lastBtnLeftDown >= LONG_PRESS_MS)) {
     btnLeftHeld = true;
@@ -3470,8 +4057,7 @@ void handleButtons() {
       alarmSnoozeIdx   = -1;
     }
     else {
-      currentPage = nextEnabledPage(currentPage, -1);
-      beepPageChange();
+      requestWifiWindow();
     }
   }
   if (!btnLNow && btnLeftPrev) {
@@ -3479,23 +4065,31 @@ void handleButtons() {
       if (alarmFiring)       { snoozeAlarm(); }
       else if (timerFiring)  { dismissTimer(); }
       else {
-        currentPage = nextEnabledPage(currentPage, 1);
+        currentPage = nextEnabledPage(currentPage, -1);
         beepPageChange();
+        lastDisplayUpdateMs = 0;
       }
     }
     btnLeftHeld = false;
   }
   btnLeftPrev = btnLNow;
 
-  // BTN_MIDDLE: short press refreshes online weather. Long press is reserved.
+  // GPIO18/KEY: short press = next page.
   if (btnMNow && !btnMiddlePrev) { lastBtnMiddleDown = now; btnMiddleHeld = false; }
   if (btnMNow && btnMiddlePrev && !btnMiddleHeld && (now - lastBtnMiddleDown >= LONG_PRESS_MS)) {
     btnMiddleHeld = true;
-    // Reserved for a future local action.
+    if (alarmFiring) dismissAlarm();
+    else if (timerFiring) dismissTimer();
   }
   if (!btnMNow && btnMiddlePrev) {
     if (!btnMiddleHeld && (now - lastBtnMiddleDown > 30) && (now - lastBtnMiddleDown < LONG_PRESS_MS)) {
-      if (wifiConnected) fetchWeatherData();
+      if (alarmFiring) snoozeAlarm();
+      else if (timerFiring) dismissTimer();
+      else {
+        currentPage = nextEnabledPage(currentPage, 1);
+        beepPageChange();
+        lastDisplayUpdateMs = 0;
+      }
     }
     btnMiddleHeld = false;
   }
@@ -3514,6 +4108,11 @@ void setup() {
   analogReadResolution(12);
   analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
   nvsLoad();
+  updateBatteryState(readBatteryVoltage());
+  lastBatteryReadMs = millis();
+  gpio_wakeup_enable((gpio_num_t)BTN_LEFT, GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable((gpio_num_t)BTN_MIDDLE, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
 
   Wire.begin(13, 14);
   initAudio();
@@ -3554,18 +4153,22 @@ void setup() {
 
   if (wifiConnected) {
     startWebServer();
-    drawBoot("Loading outdoor weather...", 0); fetchWeatherData();
+    drawBoot("Loading outdoor weather...", 0); fetchAllOnlineData();
+    lastOnlineAttemptMs = millis();
     bootLine--; drawBoot(weatherData.valid ? "Outdoor weather loaded" : "Weather unavailable", weatherData.valid ? 1 : -1);
     drawBoot("Syncing location time...", 0); syncRTCWithNTP();
     bootLine--; drawBoot("Location clock synced", 1);
+    if (lowPowerMode) wifiWindowUntilMs = millis() + 30000UL;
+  } else {
+    drawBoot("Starting phone setup...", 0);
+    startProvisioningPortal();
+    bootLine--; drawBoot("Join SEN66-Setup", 1);
   }
 
   if (senReady) {
     delay(1100);
     if (readSen66()) sensorReadCount++; else sensorFailCount++;
   }
-  batteryVoltage = readBatteryVoltage();
-  lastBatteryReadMs = millis();
   lastSensorReadMs = millis();
 
   history.initialized=false; history.currentIndex=0; history.sampleCount=0; history.lastLogTime=millis();
@@ -3586,10 +4189,13 @@ void loop() {
   hour24    = rtc.getHour();
   minuteVal = rtc.getMinute();
   // secondVal needed for dashboard (page 0) and analogue clock (page 1) second hands
-  if (currentPage == 0 || currentPage == 1) secondVal = rtc.getSecond();
+  secondVal = rtc.getSecond();
 
   unsigned long now = millis();
-  if (now - lastSensorReadMs >= 1000UL) {
+  serviceConnectivity();
+  serviceSen66Power();
+  if (sen66MeasurementRunning && now - sen66StartedMs >= 1100UL &&
+      now - lastSensorReadMs >= 1000UL) {
     lastSensorReadMs = now;
     if (readSen66()) {
       sensorReadCount++;
@@ -3606,7 +4212,8 @@ void loop() {
   }
   if (now - lastBatteryReadMs >= 10000UL) {
     lastBatteryReadMs=now;
-    batteryVoltage=readBatteryVoltage();
+    updateBatteryState(readBatteryVoltage());
+    logBatteryTrend();
   }
   // Low battery warning beep — fires when voltage drops below 3.50V, at most once per minute
   unsigned long nowMs = millis();
@@ -3626,15 +4233,8 @@ void loop() {
     history.initialized = (history.sampleCount >= HISTORY_SIZE);
   }
 
-  if (wifiConnected && (weatherData.lastUpdate == 0 || (now - weatherData.lastUpdate) > 1800000UL))
-    fetchWeatherData();
-
-  // Re-sync RTC with NTP every 24 hours
-  if (wifiConnected && (ntpLastSync == 0 || (now - ntpLastSync) > 86400000UL))
-    syncRTCWithNTP();
-
   // Web UI triggered actions (set by handlers, actioned here on main thread)
-  if (webRefreshWeather) { webRefreshWeather = false; if (wifiConnected) fetchWeatherData(); }
+  if (webRefreshWeather) { webRefreshWeather = false; if (wifiConnected) fetchAllOnlineData(); }
   if (webSyncNTP)        { webSyncNTP        = false; if (wifiConnected) syncRTCWithNTP(); }
   if (webPageBeep)       { webPageBeep       = false; beepPageChange(); }
   // Timer/stopwatch/alarm web flags
@@ -3660,6 +4260,7 @@ void loop() {
     autoCycleLastMs = now;
     currentPage = nextEnabledPage(currentPage, 1);
     beepPageChange();
+    lastDisplayUpdateMs = 0;
   }
 
   // Display sleep — skip all canvas draws when sleeping.
@@ -3681,13 +4282,35 @@ void loop() {
     // Blank the screen so nothing remains visible while sleeping
     canvas.fillScreen(0);
     pushCanvasToRLCD(false);
+    RlcdPort.RLCD_Sleep();
+  }
+  if (wasSleeping && !nowSleeping) {
+    RlcdPort.RLCD_Wake();
+    lastDisplayUpdateMs = 0;
   }
   wasSleeping = nowSleeping;
 
   if (nowSleeping) {
     delay(100);   // idle — no SPI writes while sleeping
   } else {
-    draw();
-    delay(16);
+    if (lastDisplayUpdateMs == 0 ||
+        now - lastDisplayUpdateMs >= DISPLAY_UPDATE_MS) {
+      draw();
+      lastDisplayUpdateMs = millis();
+    }
+  }
+
+  // Timer and either active-low button wake light sleep. Wi-Fi, audible alerts,
+  // and the guarded outdoor calibration keep the CPU awake.
+  bool canLightSleep = lowPowerMode && !wifiConnected && !provisioningActive &&
+    !alarmFiring && !timerFiring &&
+    co2Calibration.state != CO2_CAL_STABILIZING &&
+    co2Calibration.state != CO2_CAL_EXECUTING &&
+    digitalRead(BTN_LEFT) == HIGH && digitalRead(BTN_MIDDLE) == HIGH;
+  if (canLightSleep) {
+    esp_sleep_enable_timer_wakeup(200000ULL);
+    esp_light_sleep_start();
+  } else if (!nowSleeping) {
+    delay(20);
   }
 }

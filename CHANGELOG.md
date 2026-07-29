@@ -1,5 +1,20 @@
 # Change Log
 
+## Power and weather revision - 2026-07-29
+
+- Replaced the battery ADC equation with calibrated millivolt sampling and the board divider ratio.
+- Added two-decimal voltage output and three-decimal System Information output.
+- Added a voltage-based charge estimate and a discharge trend to 20 percent.
+- Added low-power SEN66 duty control and hourly VOC state storage.
+- Added 30-minute OpenWeather updates and rain-based ten-minute updates.
+- Added a 60-minute precipitation page.
+- Added previous-page control on GPIO 0 and next-page control on GPIO 18.
+- Added a five-minute Wi-Fi window after a one-second GPIO 0 hold.
+- Added light sleep with wake control from both buttons.
+- Added a ten-minute network setup access point after a failed startup connection.
+- Added an Arduino-to-ESP-IDF migration plan.
+- Applied the STE-flavored writing standard to project documentation.
+
 ## Dynamic location time and outdoor CO2 calibration - 2026-07-25
 
 - Replaced the compiled Eastern POSIX timezone with coordinate-derived timezone

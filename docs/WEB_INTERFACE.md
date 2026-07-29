@@ -13,6 +13,10 @@ The ESP32 listens on TCP port 80 after joining the configured Wi-Fi network. The
 | `/seasons` | Northern Hemisphere season summary |
 | `/timers` | countdown timer, stopwatch, alarm configuration, and alarm audio |
 
+The root page shows battery voltage, estimated charge, power mode, and estimated time to 20 percent.
+
+The time estimate needs five samples and two hours of discharge data.
+
 ## 3. Control endpoints
 
 Most legacy controls use HTTP GET requests for state-changing operations. The
@@ -31,7 +35,7 @@ authentication and request-origin protection.
 | `/setbeepvol` | `v` | sets audio amplitude percentage |
 | `/setinvert` | `v` | changes display inversion |
 | `/setweatherlocation` | `v` | validates and stores decimal latitude/longitude |
-| `/refresh` | none | schedules WeatherAPI refresh |
+| `/refresh` | none | schedules WeatherAPI and OpenWeather refresh |
 | `/co2cal/start` (POST) | `confirmed=true` | downloads pressure and begins the guarded five-minute outdoor calibration |
 | `/co2cal/cancel` (POST) | none | cancels qualification before the FRC write starts |
 | `/co2cal/status` (GET) | none | returns calibration state, countdown, CO2, pressure, and reference-band status |
@@ -54,10 +58,10 @@ The location control accepts one comma-separated latitude/longitude pair:
 
 Validation enforces:
 
-- one comma;
-- numeric parsing of both fields;
-- latitude between -90 and +90;
-- longitude between -180 and +180;
+- one comma
+- numeric parsing of both fields
+- latitude between -90 and +90
+- longitude between -180 and +180
 - maximum stored length.
 
 The stored value replaces the compiled `weatherLocation` default for future
@@ -71,14 +75,16 @@ The root page contains a persistent forced-CO2 recalibration control. The
 operator must confirm that the complete SEN66 assembly is outdoors. Starting
 the workflow then:
 
-1. requires an active Wi-Fi connection and valid SEN66 CO2 frame;
-2. performs a new WeatherAPI request for the configured latitude/longitude;
-3. validates `pressure_mb` as 700-1200 hPa;
-4. sends that pressure to the SEN66 before qualification;
-5. requires five continuous minutes between 350 and 450 ppm;
-6. resets the timer whenever the reading is invalid or outside the band;
-7. stops continuous measurement, waits 1500 ms, performs FRC at 400 ppm, and
-   restarts continuous measurement.
+1. Require an active Wi-Fi connection and a valid SEN66 CO2 frame.
+2. Request new WeatherAPI data for the configured coordinates.
+3. Validate `pressure_mb` from 700 through 1200 hPa.
+4. Send the pressure to the SEN66 before qualification.
+5. Require five continuous minutes from 350 through 450 ppm.
+6. Reset the timer after an invalid or out-of-band reading.
+7. Stop continuous measurement.
+8. Wait 1500 ms.
+9. Run FRC at 400 ppm.
+10. Restart continuous measurement.
 
 The outdoor checkbox is an operator attestation. The device cannot determine
 whether it is physically outdoors or whether the reference atmosphere is
@@ -120,7 +126,7 @@ Runtime countdown and stopwatch progress are not persisted across reset.
 - An unchecked page is skipped.
 - Direct web selection is always permitted for diagnostics.
 - At least one page must remain checked.
-- Alarm/timer firing can force page 12.
+- Alarm or timer activation can force page 13.
 
 ## 8. Audio separation
 
@@ -134,10 +140,30 @@ Both flags are persistent. Disabling either flag does not remove the relevant vi
 
 For any network other than a controlled home/lab LAN:
 
-- place the device on an isolated IoT VLAN;
-- block inbound connections from untrusted segments;
-- do not port-forward TCP 80;
-- add authentication and CSRF protection before shared deployment;
-- avoid returning SSID or precise location data to unauthenticated clients;
-- migrate mutating endpoints to authenticated POST requests;
-- apply request-rate limits.
+- Place the device on an isolated IoT VLAN.
+- Block inbound connections from untrusted segments.
+- Do not forward TCP port 80.
+- Add authentication and CSRF protection before shared deployment.
+- Do not return the SSID or precise location to unauthenticated clients.
+- Change state control endpoints to authenticated POST requests.
+- Apply request-rate limits.
+
+## 10. Low-power web access
+
+The firmware turns Wi-Fi off between remote data updates in low-power mode.
+
+Hold GPIO 0 for one second to start a five-minute Wi-Fi window.
+
+The web interface is unavailable after that window closes.
+
+## 11. Setup access point
+
+The firmware starts `SEN66-Setup` for ten minutes after a failed startup connection.
+
+Connect a phone to this access point with the password `sen66-setup`.
+
+The setup page stores a Wi-Fi SSID, a password, and coordinates in NVS.
+
+The page can request the phone location. Browser security can block location access on local HTTP pages.
+
+Enter the coordinates manually if the browser blocks location access.

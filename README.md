@@ -2,16 +2,20 @@
 
 Firmware and operating documentation for a desktop indoor-air-quality station built on the Waveshare ESP32-S3-RLCD-4.2 and a Sensirion SEN66 connected to the board's external I2C bus.
 
-The SEN66 is the authoritative source for indoor temperature, relative humidity, carbon dioxide, VOC Index, NOx Index, and particulate-matter measurements. WeatherAPI supplies outdoor conditions, forecasts, sunrise and sunset, and outdoor PM2.5 data. The 400 x 300 reflective LCD presents thirteen local pages; an embedded HTTP interface provides configuration, page selection, timer/alarm control, and live data inspection.
+The SEN66 supplies indoor temperature, humidity, CO2, VOC Index, NOx Index, and particle data.
+
+WeatherAPI supplies forecasts, astronomy data, pressure, and location time data. OpenWeather supplies minute forecasts and outdoor air data.
+
+The 400 x 300 reflective LCD has 14 pages. A local web interface controls settings, pages, timers, alarms, and calibration.
 
 ## Engineering status
 
 - Target hardware: Waveshare ESP32-S3-RLCD-4.2
 - Application framework: Arduino-ESP32
-- Reference build date: 2026-07-25
+- Reference build date: 2026-07-29
 - Reference core: Espressif Arduino-ESP32 3.3.11
-- Reference binary size: 1,308,235 bytes
-- Reference dynamic allocation: 50,320 bytes of global data
+- Reference binary size: 1,351,061 bytes
+- Reference dynamic allocation: 52,648 bytes of global data
 - Display units: degrees Fahrenheit and miles per hour
 - Primary indoor sensor: Sensirion SEN66 at I2C address `0x6B`
 
@@ -44,14 +48,15 @@ Indoor particle AQI is calculated locally from the current PM2.5 and PM10 readin
 | 2 | North American Time Zones |
 | 3 | Outdoor Conditions |
 | 4 | Next Six Forecast Hours |
-| 5 | Three-Day Forecast |
-| 6 | Northern Hemisphere Seasons |
-| 7 | Season Orbit |
-| 8 | Temperature History |
-| 9 | Humidity History |
-| 10 | System Information |
-| 11 | Complete SEN66 Output |
-| 12 | Timers, Stopwatch, and Alarms |
+| 5 | OpenWeather 60-Minute Rain Forecast |
+| 6 | Three-Day Forecast |
+| 7 | Northern Hemisphere Seasons |
+| 8 | Season Orbit |
+| 9 | Temperature History |
+| 10 | Humidity History |
+| 11 | System Information |
+| 12 | Complete SEN66 Output |
+| 13 | Timers, Stopwatch, and Alarms |
 
 The web interface stores a page-inclusion mask in NVS. Unchecked pages are skipped by both hardware-button navigation and automatic cycling. A page can still be selected directly from the web interface for inspection.
 
@@ -59,7 +64,7 @@ The web interface stores a page-inclusion mask in NVS. Unchecked pages are skipp
 
 The ESP32 serves an unauthenticated HTTP interface on its LAN address. Available controls include:
 
-- immediate WeatherAPI refresh
+- immediate WeatherAPI and OpenWeather refresh
 - guarded outdoor SEN66 forced-CO2 recalibration using freshly downloaded local pressure
 - immediate NTP synchronization
 - weather location replacement using decimal `latitude,longitude`
@@ -70,6 +75,8 @@ The ESP32 serves an unauthenticated HTTP interface on its LAN address. Available
 - direct LCD page selection
 - current-display screenshot as a one-bit BMP
 - countdown timer, stopwatch, and three persistent alarms
+- battery state-of-charge and time-to-20-percent estimates
+- a ten-minute Wi-Fi setup access point after a failed boot connection
 
 The interface is intended for a trusted local network. It does not implement TLS, user authentication, or authorization. See [Security](SECURITY.md).
 
@@ -96,6 +103,7 @@ Install the following through Arduino IDE Board Manager and Library Manager:
 |---|---:|---|
 | Espressif ESP32 Arduino core | 3.3.11 | ESP32-S3 runtime, Wi-Fi, HTTP, NVS, I2S, and ESP-IDF display interfaces |
 | Adafruit GFX Library | 1.12.6 | One-bit canvas and graphics primitives |
+| ArduinoJson | 7.4.3 | Filtered OpenWeather response parsing |
 | Sensirion I2C SEN66 | 1.3.1 | SEN66 command and measurement driver |
 | Sensirion Core | 0.7.3 | Sensirion I2C framing, CRC, and error support |
 | Soldered PCF85063A RTC Arduino Library | 1.0.0 | PCF85063A RTC access |
@@ -114,7 +122,8 @@ The audio implementation uses the Arduino-ESP32 3.x `ESP_I2S` API and will not c
 const char* ssid = "YOUR_WIFI_SSID";
 const char* password = "YOUR_WIFI_PASSWORD";
 const char* weatherApiKey = "YOUR_WEATHERAPI_KEY";
-const char* weatherLocation = "YOUR_CITY_OR_LAT_LON";
+const char* OpenWeatherMapApiKey = "YOUR_OPENWEATHERMAP_KEY";
+const char* weatherLocation = "40.712800,-74.006000";
 ```
 
 `weatherLocation` is the first-boot default. A valid location entered through
@@ -140,12 +149,17 @@ The display driver allocates its frame buffer and lookup tables in PSRAM. A buil
 
 | Operation | Interval |
 |---|---:|
-| SEN66 measurement read | 1 second |
+| SEN66 read while active | 1 second |
+| SEN66 low-power duty cycle | 90 seconds per 10-minute slot |
+| SEN66 hourly conditioning | minute 50 through minute 59 |
 | Battery ADC read | 10 seconds |
 | Temperature/humidity history sample | 15 minutes |
 | History capacity | 24 samples / 6 hours |
 | WeatherAPI refresh | 30 minutes |
+| OpenWeather normal refresh | 30 minutes |
+| OpenWeather rain refresh | 10 minutes for up to 2 hours |
 | NTP synchronization | 24 hours |
+| LCD update limit | 0.5 Hz |
 | LCD auto-cycle dwell | 3 to 300 seconds, configurable |
 
 ## Documentation index
@@ -154,7 +168,10 @@ The display driver allocates its frame buffer and lookup tables in PSRAM. A buil
 - [Hardware integration](docs/HARDWARE.md)
 - [Data processing and AQI](docs/DATA_PROCESSING.md)
 - [Web interface and persistence](docs/WEB_INTERFACE.md)
+- [Power, battery, and network control](docs/POWER_AND_NETWORK.md)
+- [ESP-IDF migration plan](docs/ESP_IDF_MIGRATION.md)
 - [Build, commissioning, and maintenance](docs/OPERATIONS.md)
+- [Documentation writing standard](docs/WRITING_STANDARD.md)
 - [Source provenance and third-party attribution](ATTRIBUTION.md)
 - [Security model](SECURITY.md)
 
@@ -174,5 +191,5 @@ No project-wide open-source license is asserted here because the immediate upstr
 - CO2, VOC, and NOx outputs require sensor startup and conditioning time.
 - Forced CO2 recalibration is persistent. Use the web workflow only with the
   complete SEN66 outdoors in a homogeneous, known 400 ppm reference environment.
-- Battery voltage thresholds are approximate and are not a fuel-gauge algorithm.
+- Battery state of charge uses voltage. It is not a coulomb-counted result.
 - The web interface must not be exposed directly to the public internet.

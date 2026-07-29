@@ -55,6 +55,8 @@ public:
   ~DisplayPort();
   
   void RLCD_Init();
+  void RLCD_Sleep();
+  void RLCD_Wake();
   void RLCD_ColorClear(uint8_t color);
   void RLCD_Display();
 #if (AlgorithmOptimization != 3)
