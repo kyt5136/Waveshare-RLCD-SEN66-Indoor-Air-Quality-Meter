@@ -131,7 +131,7 @@ See [Power, battery, and network control](POWER_AND_NETWORK.md) for the calibrat
 
 ## 9. Power behavior
 
-The firmware uses light sleep when battery voltage is below the external-power threshold.
+The firmware uses light sleep when it does not detect a USB host.
 
 It also stops SEN66 measurements between sample windows. Stop and start commands keep power on the sensor.
 

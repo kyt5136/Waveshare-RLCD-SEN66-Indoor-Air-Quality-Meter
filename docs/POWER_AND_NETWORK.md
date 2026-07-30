@@ -5,15 +5,24 @@
 The firmware has an external-power mode and a low-power mode.
 
 The Arduino build uses the ESP32-S3 hardware USB CDC interface.
-The firmware checks `Serial.isPlugged()` for a connected USB host.
+The firmware checks `Serial.isPlugged()` for USB start-of-frame activity.
 
-USB host detection selects external-power mode immediately.
-Battery voltage provides a second detection path.
-The voltage path enters external-power mode at 4.18 V.
-It returns to low-power mode at 4.12 V.
+The firmware samples USB status every 250 milliseconds.
+It confirms a connection after 250 milliseconds.
+It confirms a disconnection after two seconds.
 
-A full cell can keep external-power mode active after USB removal.
-This condition ends when the cell voltage reaches 4.12 V.
+USB host detection is the only automatic external-power input.
+Battery voltage does not select external-power mode.
+A full battery and a charging battery can have the same voltage.
+
+A charge-only USB supply does not provide USB host activity.
+The firmware uses low-power mode with that supply.
+This fail-safe choice protects battery runtime after USB removal.
+
+The board schematic does not route VBUS or charger status to a dedicated ESP32 input.
+A future hardware revision should add a divided VBUS input or a charger-status input.
+
+Reference: [Waveshare ESP32-S3-RLCD-4.2 schematic](https://files.waveshare.com/wiki/ESP32-S3-RLCD-4.2/ESP32-S3-RLCD-4.2-schematic.pdf).
 
 ## Battery measurement
 
@@ -131,6 +140,26 @@ Low-power mode uses 200 ms light-sleep intervals between work.
 Wi-Fi, alarms, timers, CO2 calibration, and the interaction window prevent light sleep.
 
 The reflective display has no backlight. The ESP32-S3 and SEN66 remain the primary battery loads.
+
+## Recommended power work
+
+Add a divided VBUS signal to a spare GPIO in the next board revision.
+This signal gives a direct external-power state without an active USB host.
+
+Add the charger status signal if the firmware must show the charge state.
+Do not use the charger status signal as the only external-power signal.
+
+Replace the fixed 200 ms sleep interval with a deadline-based sleep interval.
+Wake only for a button, a sensor deadline, a network deadline, or a timer event.
+
+Render a page only when its visible data changes.
+Update the clock once each minute on pages that do not show seconds.
+
+Disable the audio circuit between alerts if the hardware provides a power control.
+Measure the disabled current before this control becomes part of the power budget.
+
+Use late SEN66 samples for the SHTC3 correction model.
+This rule reduces the effect of sensor warm-up on the temperature difference.
 
 ## Network setup portal
 

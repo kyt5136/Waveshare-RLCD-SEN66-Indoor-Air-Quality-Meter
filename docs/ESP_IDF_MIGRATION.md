@@ -43,6 +43,13 @@ Each component must own one hardware or application function.
 
 `battery_service` must own ADC calibration, state-of-charge estimation, and power-mode hysteresis.
 
+The current board does not give the ESP32 a dedicated VBUS or charger-status input.
+Use USB Serial/JTAG connection status for the current hardware.
+Add a divided VBUS input or charger-status input in a future board revision.
+Do not infer external power from a full-cell voltage.
+
+The ESP-IDF display service must follow [the LCD user interface design standard](UI_DESIGN_STANDARD.md).
+
 `weather_service` must own WeatherAPI and OpenWeather requests. It must also own the daily call limit.
 
 `network_service` must own station mode, access-point mode, and the five-minute Wi-Fi window.

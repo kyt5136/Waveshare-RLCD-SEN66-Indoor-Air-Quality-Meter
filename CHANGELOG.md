@@ -1,5 +1,18 @@
 # Change Log
 
+## LCD design standard and USB power detection - 2026-07-29
+
+- Added one reusable black header with a fixed page title and local time.
+- Applied the header to all 14 LCD pages.
+- Removed location coordinates and location strings from LCD headers.
+- Added bold label and value fonts for better one-bit display legibility.
+- Standardized the measurement-box labels, baselines, spacing, and units.
+- Moved `ppm` into the CO2 labels to permit larger CO2 values.
+- Added an LCD design standard for the future ESP-IDF port.
+- Removed battery voltage as an automatic external-power signal.
+- Added USB host connection and disconnection confirmation periods.
+- Set low-power mode within two seconds after USB host removal.
+
 ## Display, sensor comparison, and startup diagnostics - 2026-07-29
 
 - Added a complete startup scan for I2C addresses `0x01` through `0x7E`.

@@ -57,6 +57,7 @@ The main Arduino loop is cooperative. There is no application-created FreeRTOS t
 | 10 s | battery ADC |
 | 15 s | SHTC3 temperature and humidity |
 | 15 min | temperature/humidity history insertion |
+| 250 ms | USB host-state sample |
 | 30 min | WeatherAPI update |
 | 30 min | Normal OpenWeather update |
 | 10 min | OpenWeather update during a two-hour rain event |
@@ -66,6 +67,8 @@ The main Arduino loop is cooperative. There is no application-created FreeRTOS t
 | configurable | automatic page change |
 
 The ESP32 networking and web-server implementation uses framework facilities underneath the sketch. Application code remains single-threaded from the sketch's perspective. Web handlers set flags for operations that should run from the main loop rather than performing every long operation inside the HTTP callback.
+
+All LCD pages use the shared frame and typography rules in [the LCD user interface design standard](UI_DESIGN_STANDARD.md).
 
 ## 5. Data ownership
 

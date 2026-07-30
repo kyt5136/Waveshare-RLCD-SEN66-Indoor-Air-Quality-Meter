@@ -16,10 +16,10 @@
 
 #include <Arduino.h>
 #include <Adafruit_GFX.h>
-#include <Fonts/FreeSans9pt7b.h>
-#include <Fonts/FreeSans12pt7b.h>
 #include <Fonts/FreeSans18pt7b.h>
 #include <Fonts/FreeSans24pt7b.h>
+#include <Fonts/FreeSansBold9pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -70,8 +70,9 @@ static const uint8_t SHTC3_ADDR = 0x70;
 // This unit reads correctly at 1.020 after comparison with a DMM.
 static constexpr float BATTERY_DIVIDER_RATIO = 3.0f;
 static constexpr float BATTERY_CALIBRATION = 1.020f;
-static constexpr float EXTERNAL_POWER_ENTER_V = 4.18f;
-static constexpr float EXTERNAL_POWER_EXIT_V = 4.12f;
+static constexpr unsigned long USB_STATUS_SAMPLE_MS = 250UL;
+static constexpr unsigned long USB_CONNECT_CONFIRM_MS = 250UL;
+static constexpr unsigned long USB_DISCONNECT_CONFIRM_MS = 2000UL;
 static constexpr unsigned long DISPLAY_UPDATE_MS = 2000UL;  // 0.5 Hz
 static constexpr unsigned long DISPLAY_INTERACTIVE_UPDATE_MS = 250UL;
 static constexpr unsigned long DISPLAY_INTERACTIVE_WINDOW_MS = 60000UL;
@@ -84,8 +85,8 @@ static constexpr unsigned long WIFI_NORMAL_MS = 1800000UL;
 static constexpr unsigned long WIFI_RAIN_MS = 600000UL;
 static constexpr unsigned long WIFI_MANUAL_WINDOW_MS = 300000UL;
 
-#define FONT_SMALL   FreeSans9pt7b
-#define FONT_MEDIUM  FreeSans12pt7b
+#define FONT_SMALL   FreeSansBold9pt7b
+#define FONT_MEDIUM  FreeSansBold12pt7b
 #define FONT_LARGE   FreeSans18pt7b
 #define FONT_XLARGE  FreeSans24pt7b
 
@@ -103,13 +104,14 @@ float humidity       = 0.0f;
 float batteryVoltage = 0.0f;
 float batterySoc     = 0.0f;
 bool  batteryStateInitialized = false;
-bool  voltageExternalPowerLikely = false;
 bool  usbHostConnected = false;
 bool  externalPowerLikely = false;
-bool  lowPowerMode   = false;
+bool  lowPowerMode   = true;
 bool  displayHighPower = true;
 unsigned long displayInteractiveUntilMs = 0;
 unsigned long lastUsbCheckMs = 0;
+bool  usbCandidateConnected = false;
+unsigned long usbCandidateChangedMs = 0;
 int   wifiRSSI       = 0;
 int   hour24         = 0;
 int   minuteVal      = 0;
@@ -1586,29 +1588,44 @@ void updateBatteryState(float measuredVoltage) {
   batterySoc = batteryStateInitialized ?
                batterySoc * 0.90f + instantSoc * 0.10f : instantSoc;
   batteryStateInitialized = true;
-
-  // Hysteresis prevents Wi-Fi and SEN66 load steps from rapidly changing modes.
-  if (!voltageExternalPowerLikely && measuredVoltage >= EXTERNAL_POWER_ENTER_V)
-    voltageExternalPowerLikely = true;
-  else if (voltageExternalPowerLikely && measuredVoltage <= EXTERNAL_POWER_EXIT_V)
-    voltageExternalPowerLikely = false;
-  externalPowerLikely = usbHostConnected || voltageExternalPowerLikely;
-  lowPowerMode = !externalPowerLikely;
 }
 
 void serviceUsbHostState(bool forceCheck = false) {
   unsigned long now = millis();
-  if (!forceCheck && now - lastUsbCheckMs < 1000UL) return;
+  if (!forceCheck && now - lastUsbCheckMs < USB_STATUS_SAMPLE_MS) return;
   lastUsbCheckMs = now;
   bool plugged = false;
 #if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
   plugged = Serial.isPlugged();
 #endif
-  if (plugged != usbHostConnected) {
+
+  if (forceCheck) {
+    bool previousState = usbHostConnected;
+    usbCandidateConnected = plugged;
+    usbCandidateChangedMs = now;
     usbHostConnected = plugged;
-    Serial.printf("[POWER] USB host %s\n", plugged ? "connected" : "disconnected");
+    if (usbHostConnected != previousState) {
+      Serial.printf("[POWER] USB host %s\n",
+                    usbHostConnected ? "connected" : "disconnected");
+    }
+  } else {
+    if (plugged != usbCandidateConnected) {
+      usbCandidateConnected = plugged;
+      usbCandidateChangedMs = now;
+    }
+    unsigned long confirmationMs = usbCandidateConnected ?
+      USB_CONNECT_CONFIRM_MS : USB_DISCONNECT_CONFIRM_MS;
+    if (usbCandidateConnected != usbHostConnected &&
+        now - usbCandidateChangedMs >= confirmationMs) {
+      usbHostConnected = usbCandidateConnected;
+      Serial.printf("[POWER] USB host %s\n",
+                    usbHostConnected ? "connected" : "disconnected");
+    }
   }
-  externalPowerLikely = usbHostConnected || voltageExternalPowerLikely;
+
+  // Cell voltage cannot distinguish a full battery from charge-only USB power.
+  // Use the hardware USB host signal as the only automatic external-power input.
+  externalPowerLikely = usbHostConnected;
   lowPowerMode = !externalPowerLikely;
 }
 
@@ -2053,6 +2070,54 @@ void pushCanvasToRLCD(bool invert = false) {
   RlcdPort.RLCD_Display();
 }
 
+static constexpr int UI_HEADER_X = 8;
+static constexpr int UI_HEADER_Y = 8;
+static constexpr int UI_HEADER_W = 384;
+static constexpr int UI_HEADER_H = 26;
+
+void drawCenteredTextInRect(const GFXfont* textFont, int x, int width,
+                            int baseline, const char* text) {
+  canvas.setFont(textFont);
+  int16_t x1, y1;
+  uint16_t textWidth, textHeight;
+  canvas.getTextBounds(text, 0, baseline, &x1, &y1, &textWidth, &textHeight);
+  canvas.setCursor(x + (width - (int)textWidth) / 2 - x1, baseline);
+  canvas.print(text);
+}
+
+void beginDisplayPage(const char* title) {
+  canvas.fillScreen(0);
+  canvas.setTextWrap(false);
+  canvas.drawRect(0, 0, W, H, 1);
+  canvas.drawRect(1, 1, W - 2, H - 2, 1);
+  canvas.fillRect(UI_HEADER_X, UI_HEADER_Y, UI_HEADER_W, UI_HEADER_H, 1);
+
+  canvas.setTextColor(0);
+  canvas.setFont(&FONT_SMALL);
+  canvas.setCursor(UI_HEADER_X + 7, UI_HEADER_Y + 19);
+  canvas.print(title);
+
+  char clockText[6];
+  snprintf(clockText, sizeof(clockText), "%02d:%02d", hour24, minuteVal);
+  int16_t x1, y1;
+  uint16_t textWidth, textHeight;
+  canvas.getTextBounds(clockText, 0, UI_HEADER_Y + 19,
+                       &x1, &y1, &textWidth, &textHeight);
+  canvas.setCursor(UI_HEADER_X + UI_HEADER_W - 7 - textWidth - x1,
+                   UI_HEADER_Y + 19);
+  canvas.print(clockText);
+  canvas.setTextColor(1);
+}
+
+void drawMetricBox(int x, int y, int width, int height,
+                   const char* label, const String& value,
+                   const GFXfont* valueFont) {
+  canvas.drawRect(x, y, width, height, 1);
+  canvas.setTextColor(1);
+  drawCenteredTextInRect(&FONT_SMALL, x, width, y + 18, label);
+  drawCenteredTextInRect(valueFont, x, width, y + height - 11, value.c_str());
+}
+
 void drawThermometerIcon(int x, int y) {
   canvas.drawCircle(x+3, y+18, 4, 1); canvas.fillCircle(x+3, y+18, 2, 1);
   canvas.fillRect(x+1, y, 4, 16, 1);  canvas.fillRect(x+2, y, 2, 16, 0);
@@ -2080,16 +2145,7 @@ void drawWiFiIcon(int x, int y, int rssi) {
 
 // ===== PAGE 0: DASHBOARD =====
 void drawDashboardPage() {
-  canvas.fillScreen(0);
-  canvas.drawRect(0, 0, W, H, 1);
-  canvas.drawRect(1, 1, W-2, H-2, 1);
-
-  canvas.fillRect(8, 8, 384, 26, 1);
-  canvas.setTextColor(0); canvas.setFont(&FONT_SMALL);
-  canvas.setCursor(15, 27); canvas.print("SEN66 INDOOR AIR");
-  char timeStr[6]; snprintf(timeStr, sizeof(timeStr), "%02d:%02d", hour24, minuteVal);
-  canvas.setCursor(327, 27); canvas.print(timeStr);
-  canvas.setTextColor(1);
+  beginDisplayPage("INDOOR AIR");
 
   // Three primary measurements.
   const int topY = 42, topH = 82, topW = 122;
@@ -2097,22 +2153,21 @@ void drawDashboardPage() {
   canvas.drawRect(139, topY, topW, topH, 1);
   canvas.drawRect(270, topY, topW, topH, 1);
   canvas.setFont(&FONT_SMALL);
-  canvas.setCursor(15, 61); canvas.print("TEMP");
-  canvas.setCursor(146, 61); canvas.print("HUMIDITY");
-  canvas.setCursor(277, 61); canvas.print("CO2");
+  canvas.setCursor(15, 61); canvas.print("TEMP (F)");
+  canvas.setCursor(146, 61); canvas.print("RH (%)");
+  canvas.setCursor(277, 61); canvas.print("CO2 (ppm)");
 
   canvas.setFont(&FONT_LARGE);
   canvas.setCursor(15, 101);
   if (indoor.valid) {
-    canvas.print(cToF(indoor.temperature), 1); canvas.print(" F");
+    canvas.print(cToF(indoor.temperature), 1);
   } else canvas.print("--");
   canvas.setCursor(146, 101);
-  if (indoor.valid) { canvas.print((int)indoor.humidity); canvas.print(" %"); }
+  if (indoor.valid) canvas.print((int)indoor.humidity);
   else canvas.print("--");
   canvas.setCursor(277, 101);
   if (indoor.valid && indoor.co2 != 0xFFFF) canvas.print(indoor.co2);
   else canvas.print("--");
-  canvas.setFont(&FONT_SMALL); canvas.setCursor(277, 117); canvas.print("ppm");
 
   // VOC plus separate indoor and outdoor particle AQI values.
   const int midY = 132, midH = 72, midW = 122;
@@ -2145,11 +2200,11 @@ void drawDashboardPage() {
   canvas.setFont(&FONT_SMALL);
   canvas.setCursor(15, 280);
   if (!indoor.valid) {
-    canvas.print("SEN66 WAITING");
+    canvas.print("SEN66: WAITING");
   } else if (isnan(indoor.vocIndex) || isnan(indoor.noxIndex) || indoor.co2 == 0xFFFF) {
-    canvas.print("SEN66 ACTIVE / PREHEATING");
+    canvas.print("SEN66: PREHEATING");
   } else {
-    canvas.print("SEN66 ACTIVE / READY");
+    canvas.print("SEN66: READY");
   }
   canvas.setCursor(244, 280);
   canvas.print(batteryVoltage, 2); canvas.print("V ");
@@ -2161,21 +2216,7 @@ void drawDashboardPage() {
 
 // ===== PAGE 1: ANALOGUE CLOCK =====
 void drawAnalogClockPage() {
-  canvas.fillScreen(0);
-  canvas.drawRect(0, 0, W, H, 1);
-  canvas.drawRect(1, 1, W-2, H-2, 1);
-
-  // Inverted header bar — location + timezone
-  canvas.fillRect(8, 8, 384, 22, 1);
-  canvas.setTextColor(0);
-  canvas.setFont(&FONT_SMALL);
-  char hdrBuf[32];
-  snprintf(hdrBuf, sizeof(hdrBuf), "%s  %s", activeWeatherLocation, getTZLabel());
-  int16_t hx1, hy1; uint16_t htw, hth;
-  canvas.getTextBounds(hdrBuf, 0, 24, &hx1, &hy1, &htw, &hth);
-  canvas.setCursor((W - htw) / 2 - hx1, 24);
-  canvas.print(hdrBuf);
-  canvas.setTextColor(1);
+  beginDisplayPage("ANALOG CLOCK");
 
   // Clock geometry — filled black face, R=110
   const int cx = 200, cy = 152, R = 110;
@@ -2287,10 +2328,7 @@ void drawAnalogClockPage() {
 
 // ===== PAGE 2: NORTH AMERICAN TIME ZONES =====
 void drawTimeZonePage() {
-  canvas.fillScreen(0);
-  canvas.drawRect(0, 0, W, H, 1); canvas.drawRect(1, 1, W-2, H-2, 1);
-  canvas.setFont(&FONT_SMALL); canvas.setTextColor(1);
-  printCentered(&FONT_SMALL, 24, "NORTH AMERICAN TIME ZONES");
+  beginDisplayPage("NORTH AMERICAN TIME");
 
   time_t utcNow = time(nullptr);
   struct tm utcInfo;
@@ -2334,9 +2372,7 @@ void drawTimeZonePage() {
 
 // ===== PAGE 3: CURRENT CONDITIONS =====
 void drawCurrentWeatherPage() {
-  canvas.fillScreen(0);
-  canvas.drawRect(0, 0, W, H, 1);
-  canvas.drawRect(1, 1, W-2, H-2, 1);
+  beginDisplayPage("CURRENT CONDITIONS");
 
   if (!weatherData.valid) {
     canvas.setFont(&FONT_LARGE); canvas.setTextColor(1);
@@ -2344,9 +2380,6 @@ void drawCurrentWeatherPage() {
     canvas.setFont(&FONT_SMALL); canvas.setCursor(110, 165); canvas.print("Press KEY button");
     pushCanvasToRLCD(displayInvert); return;
   }
-
-  canvas.setFont(&FONT_SMALL); canvas.setTextColor(1);
-  canvas.setCursor(12, 25); canvas.print("CURRENT CONDITIONS  "); canvas.print(activeWeatherLocation);
 
   canvas.setFont(&FONT_XLARGE); canvas.setCursor(12, 75); canvas.print(cToF(weatherData.currentTemp), 1);
   canvas.setFont(&FONT_LARGE);  canvas.print(" F");
@@ -2410,11 +2443,9 @@ void drawCurrentWeatherPage() {
   pushCanvasToRLCD(displayInvert);
 }
 
-// ===== PAGE 5: 3-DAY FORECAST =====
+// ===== PAGE 6: 3-DAY FORECAST =====
 void drawForecastPage() {
-  canvas.fillScreen(0);
-  canvas.drawRect(0, 0, W, H, 1);
-  canvas.drawRect(1, 1, W-2, H-2, 1);
+  beginDisplayPage("3-DAY FORECAST");
 
   if (!weatherData.valid) {
     canvas.setFont(&FONT_LARGE); canvas.setTextColor(1);
@@ -2422,9 +2453,6 @@ void drawForecastPage() {
     canvas.setFont(&FONT_SMALL); canvas.setCursor(110, 165); canvas.print("Press KEY button");
     pushCanvasToRLCD(displayInvert); return;
   }
-
-  canvas.setFont(&FONT_SMALL); canvas.setTextColor(1);
-  canvas.setCursor(12, 25); canvas.print("3-DAY FORECAST  "); canvas.print(activeWeatherLocation);
 
   const int cardW = 122, cardY = 36, hdrH = 24;
   const int rowH = 40, condH = 52;
@@ -2449,13 +2477,15 @@ void drawForecastPage() {
     y += rowH;
     canvas.setFont(&FONT_SMALL);  canvas.setCursor(cx+6, y+11); canvas.print("COND");
     String fcond = weatherData.forecast[i].condition;
-    if (fcond.length() > 13) {
-      int sp = fcond.lastIndexOf(' ', 13);
+    const int conditionCharsPerLine = 11;
+    if (fcond.length() > conditionCharsPerLine) {
+      int sp = fcond.lastIndexOf(' ', conditionCharsPerLine);
       if (sp > 0) {
         canvas.setCursor(cx+6, y+28); canvas.print(fcond.substring(0, sp));
-        canvas.setCursor(cx+6, y+42); canvas.print(fcond.substring(sp+1, min((int)fcond.length(), sp+14)));
+        canvas.setCursor(cx+6, y+42);
+        canvas.print(fcond.substring(sp + 1, min((int)fcond.length(), sp + conditionCharsPerLine + 1)));
       } else {
-        canvas.setCursor(cx+6, y+28); canvas.print(fcond.substring(0, 13));
+        canvas.setCursor(cx+6, y+28); canvas.print(fcond.substring(0, conditionCharsPerLine));
       }
     } else {
       canvas.setCursor(cx+6, y+28); canvas.print(fcond);
@@ -2481,13 +2511,9 @@ void drawForecastPage() {
   pushCanvasToRLCD(displayInvert);
 }
 
-// ===== PAGE 13: SYSTEM INFO =====
+// ===== PAGE 11: SYSTEM INFO =====
 void drawSystemPage() {
-  canvas.fillScreen(0);
-  canvas.drawRect(0, 0, W, H, 1); canvas.drawRect(1, 1, W-2, H-2, 1);
-
-  canvas.setFont(&FONT_SMALL); canvas.setTextColor(1);
-  canvas.setCursor(12, 24); canvas.print("SYSTEM INFO");
+  beginDisplayPage("SYSTEM INFORMATION");
 
   // 5 rows at 44px each — label at y+12, value at y+32, 18px gap between them
   const int lx = 14, rx = 204, rowH = 44, gy0 = 36;
@@ -2544,34 +2570,29 @@ void drawSystemPage() {
   pushCanvasToRLCD(displayInvert);
 }
 
-// ===== PAGE 11: COMPLETE SEN66 OUTPUT =====
+// ===== PAGE 12: COMPLETE SEN66 OUTPUT =====
 void drawSen66DetailsPage() {
-  canvas.fillScreen(0);
-  canvas.drawRect(0, 0, W, H, 1); canvas.drawRect(1, 1, W-2, H-2, 1);
-  canvas.fillRect(8, 8, 384, 26, 1);
-  canvas.setTextColor(0); canvas.setFont(&FONT_SMALL);
-  canvas.setCursor(15, 27); canvas.print("SEN66 COMPLETE SENSOR OUTPUT");
-  canvas.setTextColor(1);
+  beginDisplayPage("SEN66 SENSOR OUTPUT");
 
-  const int lx = 14, rx = 204, rowH = 44, gy0 = 40;
+  const int lx = 8, rx = 200, cellW = 192, rowH = 44, gy0 = 40;
   canvas.fillRect(198, gy0, 2, rowH * 5, 1);
   for (int r = 1; r < 5; r++) canvas.drawFastHLine(8, gy0 + r * rowH, 384, 1);
 
   auto reading = [&](int x, int y, const char* label, const String& value) {
-    canvas.setFont(&FONT_SMALL); canvas.setCursor(x, y + 14); canvas.print(label);
-    canvas.setFont(&FONT_MEDIUM); canvas.setCursor(x, y + 36); canvas.print(value);
+    drawCenteredTextInRect(&FONT_SMALL, x, cellW, y + 14, label);
+    drawCenteredTextInRect(&FONT_MEDIUM, x, cellW, y + 36, value.c_str());
   };
   String unavailable = "--";
-  reading(lx, gy0, "TEMPERATURE", indoor.valid ? String(cToF(indoor.temperature), 1) + " F" : unavailable);
-  reading(rx, gy0, "HUMIDITY", indoor.valid ? String(indoor.humidity, 1) + " %" : unavailable);
-  reading(lx, gy0 + rowH, "CO2", indoor.valid && indoor.co2 != 0xFFFF ? String(indoor.co2) + " ppm" : unavailable);
+  reading(lx, gy0, "TEMPERATURE (F)", indoor.valid ? String(cToF(indoor.temperature), 1) : unavailable);
+  reading(rx, gy0, "HUMIDITY (%)", indoor.valid ? String(indoor.humidity, 1) : unavailable);
+  reading(lx, gy0 + rowH, "CO2 (ppm)", indoor.valid && indoor.co2 != 0xFFFF ? String(indoor.co2) : unavailable);
   reading(rx, gy0 + rowH, "VOC INDEX", indoor.valid ? String(indoor.vocIndex, 1) : unavailable);
   reading(lx, gy0 + rowH * 2, "NOx INDEX", indoor.valid ? String(indoor.noxIndex, 1) : unavailable);
   reading(rx, gy0 + rowH * 2, "INDOOR AQI", indoor.valid ? String(indoor.particleAqi) : unavailable);
-  reading(lx, gy0 + rowH * 3, "PM1.0", indoor.valid ? String(indoor.pm1, 1) + " ug/m3" : unavailable);
-  reading(rx, gy0 + rowH * 3, "PM2.5", indoor.valid ? String(indoor.pm25, 1) + " ug/m3" : unavailable);
-  reading(lx, gy0 + rowH * 4, "PM4.0", indoor.valid ? String(indoor.pm4, 1) + " ug/m3" : unavailable);
-  reading(rx, gy0 + rowH * 4, "PM10", indoor.valid ? String(indoor.pm10, 1) + " ug/m3" : unavailable);
+  reading(lx, gy0 + rowH * 3, "PM1.0 (ug/m3)", indoor.valid ? String(indoor.pm1, 1) : unavailable);
+  reading(rx, gy0 + rowH * 3, "PM2.5 (ug/m3)", indoor.valid ? String(indoor.pm25, 1) : unavailable);
+  reading(lx, gy0 + rowH * 4, "PM4.0 (ug/m3)", indoor.valid ? String(indoor.pm4, 1) : unavailable);
+  reading(rx, gy0 + rowH * 4, "PM10 (ug/m3)", indoor.valid ? String(indoor.pm10, 1) : unavailable);
 
   canvas.drawRect(8, 266, 384, 24, 1);
   canvas.setFont(&FONT_SMALL); canvas.setCursor(14, 283);
@@ -2584,10 +2605,7 @@ void drawSen66DetailsPage() {
 
 // ===== PAGE 4: HOURLY FORECAST ===== (note: function defined here, called from draw())
 void drawHourlyPage() {
-  canvas.fillScreen(0);
-  canvas.drawRect(0, 0, W, H, 1); canvas.drawRect(1, 1, W-2, H-2, 1);
-  canvas.setFont(&FONT_SMALL); canvas.setTextColor(1);
-  canvas.setCursor(12, 24); canvas.print("NEXT 6 HOURS  "); canvas.print(activeWeatherLocation);
+  beginDisplayPage("NEXT 6 HOURS");
 
   if (!hourlyData.valid) {
     canvas.setFont(&FONT_MEDIUM); canvas.setCursor(80, 150); canvas.print("NO HOURLY DATA");
@@ -2627,36 +2645,23 @@ void drawHourlyPage() {
 
 // ===== PAGE 5: 60-MINUTE PRECIPITATION =====
 void drawMinuteCastPage() {
-  canvas.fillScreen(0);
-  canvas.drawRect(0, 0, W, H, 1); canvas.drawRect(1, 1, W-2, H-2, 1);
-  canvas.fillRect(8, 8, 384, 26, 1);
-  canvas.setTextColor(0); canvas.setFont(&FONT_SMALL);
-  canvas.setCursor(15, 27); canvas.print("NEXT 60 MINUTES");
-  char clockText[8];
-  snprintf(clockText, sizeof(clockText), "%02d:%02d", hour24, minuteVal);
-  canvas.setCursor(338, 27); canvas.print(clockText);
-  canvas.setTextColor(1);
+  beginDisplayPage("NEXT 60 MINUTES");
 
   const int boxY = 42, boxH = 58, boxW = 91;
-  const char* labels[] = {"OUTSIDE", "INSIDE", "HUMIDITY", "CO2"};
+  const char* labels[] = {"OUT (F)", "IN (F)", "RH (%)", "CO2 (ppm)"};
   for (int i = 0; i < 4; i++) {
     int x = 8 + i * 97;
-    canvas.drawRect(x, boxY, boxW, boxH, 1);
-    canvas.setFont(&FONT_SMALL); canvas.setCursor(x + 5, boxY + 18);
-    canvas.print(labels[i]);
-    canvas.setFont(&FONT_MEDIUM); canvas.setCursor(x + 5, boxY + 46);
+    String value = "--";
     if (i == 0) {
-      if (owmMinute.outsideValid) {
-        canvas.print(owmMinute.outsideTempF, 1); canvas.print(" F");
-      } else canvas.print("--");
+      if (owmMinute.outsideValid) value = String(owmMinute.outsideTempF, 1);
     } else if (i == 1) {
-      canvas.print(cToF(temperature), 1); canvas.print(" F");
+      value = String(cToF(temperature), 1);
     } else if (i == 2) {
-      canvas.print(humidity, 0); canvas.print(" %");
+      value = String(humidity, 0);
     } else if (indoor.valid && indoor.co2 != 0xFFFF) {
-      canvas.setFont(&FONT_SMALL); canvas.setCursor(x + 5, boxY + 44);
-      canvas.print(indoor.co2); canvas.print(" ppm");
-    } else canvas.print("--");
+      value = String(indoor.co2);
+    }
+    drawMetricBox(x, boxY, boxW, boxH, labels[i], value, &FONT_MEDIUM);
   }
 
   const int gx = 24, gy = 122, gw = 352, gh = 112;
@@ -2762,20 +2767,17 @@ void drawEnhancedGraph(float* data, int si, int pts, int gX, int gY, int gW, int
   for (int i = 0; i <= 4; i++) { int lx = gX+(i*gW/4)-(i==4?12:6); canvas.setCursor(lx, gY+gH+14); canvas.print(xLabels[i]); }
 }
 
-// ===== PAGE 11: TEMP GRAPH =====
+// ===== PAGE 9: TEMP GRAPH =====
 void drawTempGraphPage() {
-  canvas.fillScreen(0);
-  canvas.drawRect(0, 0, W, H, 1); canvas.drawRect(1, 1, W-2, H-2, 1);
-  drawThermometerIcon(16, 14);
+  beginDisplayPage("INDOOR TEMPERATURE");
   canvas.setFont(&FONT_SMALL); canvas.setTextColor(1);
-  canvas.setCursor(38, 22); canvas.print("INDOOR TEMP");
-  canvas.setCursor(38, 38); canvas.print("6 HOUR HISTORY");
-  // Current value — FONT_LARGE fits header box without clipping
-  canvas.setFont(&FONT_LARGE); canvas.setCursor(220, 38); canvas.print(cToF(temperature), 1);
+  canvas.setCursor(14, 60); canvas.print("CURRENT");
+  // Current value
+  canvas.setFont(&FONT_LARGE); canvas.setCursor(96, 64); canvas.print(cToF(temperature), 1);
   canvas.setFont(&FONT_SMALL); canvas.print(" F");
   int startIndex = historyStartIndex();
   int tTrend = calcTrend(history.tempHistory, startIndex, history.sampleCount);
-  drawTrendArrow(375, 22, tTrend);
+  drawTrendArrow(375, 52, tTrend);
 
   if (history.sampleCount < 2) {
     canvas.setFont(&FONT_MEDIUM); canvas.setCursor(85, 155); canvas.print("COLLECTING DATA");
@@ -2783,7 +2785,7 @@ void drawTempGraphPage() {
     pushCanvasToRLCD(displayInvert); return;
   }
 
-  int gX = 44, gY = 52, gW = 336, gH = 168;
+  int gX = 44, gY = 76, gW = 336, gH = 144;
   GraphBounds b = calcGraphBounds(history.tempHistory, startIndex,
                                   history.sampleCount, 5.0f, 1.0f);
   drawEnhancedGraph(history.tempHistory, startIndex, history.sampleCount,
@@ -2803,20 +2805,17 @@ void drawTempGraphPage() {
   pushCanvasToRLCD(displayInvert);
 }
 
-// ===== PAGE 12: HUMIDITY GRAPH =====
+// ===== PAGE 10: HUMIDITY GRAPH =====
 void drawHumidityGraphPage() {
-  canvas.fillScreen(0);
-  canvas.drawRect(0, 0, W, H, 1); canvas.drawRect(1, 1, W-2, H-2, 1);
-  drawDropletIcon(16, 14);
+  beginDisplayPage("INDOOR HUMIDITY");
   canvas.setFont(&FONT_SMALL); canvas.setTextColor(1);
-  canvas.setCursor(38, 22); canvas.print("INDOOR HUMIDITY");
-  canvas.setCursor(38, 38); canvas.print("6 HOUR HISTORY");
-  // Current value — FONT_LARGE fits header box without clipping
-  canvas.setFont(&FONT_LARGE); canvas.setCursor(220, 38); canvas.print((int)humidity);
+  canvas.setCursor(14, 60); canvas.print("CURRENT");
+  // Current value
+  canvas.setFont(&FONT_LARGE); canvas.setCursor(96, 64); canvas.print((int)humidity);
   canvas.setFont(&FONT_SMALL); canvas.print(" %");
   int startIndex = historyStartIndex();
   int hTrend = calcTrend(history.humidityHistory, startIndex, history.sampleCount);
-  drawTrendArrow(375, 22, hTrend);
+  drawTrendArrow(375, 52, hTrend);
 
   if (history.sampleCount < 2) {
     canvas.setFont(&FONT_MEDIUM); canvas.setCursor(85, 155); canvas.print("COLLECTING DATA");
@@ -2824,7 +2823,7 @@ void drawHumidityGraphPage() {
     pushCanvasToRLCD(displayInvert); return;
   }
 
-  int gX = 44, gY = 52, gW = 336, gH = 168;
+  int gX = 44, gY = 76, gW = 336, gH = 144;
   GraphBounds b = calcGraphBounds(history.humidityHistory, startIndex,
                                   history.sampleCount, 10.0f, 2.0f);
   if (b.mn < 0.0f) b.mn = 0.0f; if (b.mx > 100.0f) b.mx = 100.0f;
@@ -2901,13 +2900,9 @@ String doyToDateStr(int doy, int year) {
   return String(doy)+" "+mon[constrain(m,0,11)];
 }
 
-// ===== PAGE 9: EARTH & SEASONS =====
+// ===== PAGE 7: EARTH & SEASONS =====
 void drawSeasonsPage() {
-  canvas.fillScreen(0);
-  canvas.drawRect(0, 0, W, H, 1);
-  canvas.drawRect(1, 1, W-2, H-2, 1);
-  canvas.setFont(&FONT_SMALL); canvas.setTextColor(1);
-  canvas.setCursor(12, 24); canvas.print("EARTH & SEASONS  "); canvas.print(activeWeatherLocation);
+  beginDisplayPage("SEASONS");
 
   int day   = rtc.getDay();
   int month = rtc.getMonth();
@@ -2995,11 +2990,9 @@ void drawSeasonsPage() {
 
   pushCanvasToRLCD(displayInvert);
 }
-// ===== PAGE 10: SEASONS ORBIT DIAGRAM =====
+// ===== PAGE 8: SEASONS ORBIT DIAGRAM =====
 void drawSeasonsOrbitPage() {
-  canvas.fillScreen(0);
-  canvas.drawRect(0, 0, W, H, 1);
-  canvas.drawRect(1, 1, W-2, H-2, 1);
+  beginDisplayPage("SEASON ORBIT");
 
   int day_  = rtc.getDay();
   int mon_  = rtc.getMonth();
@@ -3019,21 +3012,6 @@ void drawSeasonsOrbitPage() {
   if (dMar < minDays) minDays = dMar;
 
   // ── Header ───────────────────────────────────────────────────────────────
-  canvas.setFont(&FONT_SMALL); canvas.setTextColor(1);
-  canvas.setCursor(12, 24);
-  canvas.print("EARTH & SEASONS");
-
-  String evtStr = String(s.nextEvent);
-  int sp = evtStr.indexOf(' ');
-  if (sp > 0) evtStr = evtStr.substring(sp + 1);
-  evtStr.replace("Equinox",  "EQ");
-  evtStr.replace("Solstice", "SOL");
-  String evtFull = evtStr + " " + doyToDateStr(s.nextEventDoy, year_);
-  int16_t ex1, ey1; uint16_t etw, eth;
-  canvas.getTextBounds(evtFull.c_str(), 0, 0, &ex1, &ey1, &etw, &eth);
-  canvas.setCursor(388 - (int)etw, 24);
-  canvas.print(evtFull);
-
   // ── Corner countdown labels ───────────────────────────────────────────────
   canvas.setFont(&FONT_SMALL);
   int cDays[4]  = { dSep, dJun, dDec, dMar }; // TL=SEP EQU, TR=JUN SOL, BL=DEC SOL, BR=MAR EQU
@@ -3205,18 +3183,9 @@ void drawSeasonsOrbitPage() {
   pushCanvasToRLCD(displayInvert);
 }
 
-// ===== PAGE 20: TIMERS / STOPWATCH / ALARMS =====
+// ===== PAGE 13: TIMERS / STOPWATCH / ALARMS =====
 void drawTimersPage() {
-  canvas.fillScreen(0);
-  canvas.drawRect(0, 0, W, H, 1);
-  canvas.drawRect(1, 1, W-2, H-2, 1);
-
-  // Header bar
-  canvas.fillRect(3, 3, 394, 20, 1);
-  canvas.setTextColor(0);
-  canvas.setFont(&FONT_SMALL);
-  printCentered(&FONT_SMALL, 17, "TIMERS & ALARMS");
-  canvas.setTextColor(1);
+  beginDisplayPage("TIMERS & ALARMS");
 
   // ── Top half: Timer or Stopwatch display ─────────────────────────────────
   bool showTimer = timerState.running || timerState.expired ||

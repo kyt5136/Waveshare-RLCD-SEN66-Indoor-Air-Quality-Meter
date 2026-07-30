@@ -178,6 +178,7 @@ The serial report names expected devices, missing devices, bus errors, and unkno
 - [Data processing and AQI](docs/DATA_PROCESSING.md)
 - [Web interface and persistence](docs/WEB_INTERFACE.md)
 - [Power, battery, and network control](docs/POWER_AND_NETWORK.md)
+- [LCD user interface design standard](docs/UI_DESIGN_STANDARD.md)
 - [ESP-IDF migration plan](docs/ESP_IDF_MIGRATION.md)
 - [Build, commissioning, and maintenance](docs/OPERATIONS.md)
 - [Documentation writing standard](docs/WRITING_STANDARD.md)
