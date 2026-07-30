@@ -12,6 +12,7 @@
 - Removed battery voltage as an automatic external-power signal.
 - Added USB host connection and disconnection confirmation periods.
 - Set low-power mode within two seconds after USB host removal.
+- Reduced the current value size on both indoor history pages.
 
 ## Display, sensor comparison, and startup diagnostics - 2026-07-29
 

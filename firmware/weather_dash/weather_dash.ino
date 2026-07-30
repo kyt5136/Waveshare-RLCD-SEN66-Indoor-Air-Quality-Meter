@@ -2773,7 +2773,7 @@ void drawTempGraphPage() {
   canvas.setFont(&FONT_SMALL); canvas.setTextColor(1);
   canvas.setCursor(14, 60); canvas.print("CURRENT");
   // Current value
-  canvas.setFont(&FONT_LARGE); canvas.setCursor(96, 64); canvas.print(cToF(temperature), 1);
+  canvas.setFont(&FONT_MEDIUM); canvas.setCursor(96, 64); canvas.print(cToF(temperature), 1);
   canvas.setFont(&FONT_SMALL); canvas.print(" F");
   int startIndex = historyStartIndex();
   int tTrend = calcTrend(history.tempHistory, startIndex, history.sampleCount);
@@ -2811,7 +2811,7 @@ void drawHumidityGraphPage() {
   canvas.setFont(&FONT_SMALL); canvas.setTextColor(1);
   canvas.setCursor(14, 60); canvas.print("CURRENT");
   // Current value
-  canvas.setFont(&FONT_LARGE); canvas.setCursor(96, 64); canvas.print((int)humidity);
+  canvas.setFont(&FONT_MEDIUM); canvas.setCursor(96, 64); canvas.print((int)humidity);
   canvas.setFont(&FONT_SMALL); canvas.print(" %");
   int startIndex = historyStartIndex();
   int hTrend = calcTrend(history.humidityHistory, startIndex, history.sampleCount);

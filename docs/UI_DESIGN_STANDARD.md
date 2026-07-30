@@ -42,6 +42,7 @@ Show the active location on the web interface.
 Use `FreeSansBold9pt7b` for labels, status text, and header text.
 Use `FreeSansBold12pt7b` for normal values.
 Use `FreeSans18pt7b` or `FreeSans24pt7b` for primary values.
+Use `FreeSansBold12pt7b` for the current value above a history graph.
 
 Use DSEG7 only for the timer and stopwatch digits.
 Do not use DSEG7 for measurements or labels.
