@@ -240,6 +240,12 @@ System time is preferred. WeatherAPI `localtime_epoch` is used as a fallback if 
 Temperature and humidity histories contain 24 entries sampled every 15 minutes.
 At capacity, each graph represents six hours.
 
+The history uses current SEN66 data while the SEN66 measures.
+Before model qualification, idle intervals retain the last valid SEN66 data.
+This rule prevents raw SHTC3 offsets from producing steps in the graph.
+After qualification, idle intervals use corrected SHTC3 data.
+Raw SHTC3 data enters history only when no valid SEN66 data exists.
+
 The firmware stores the history in `/history.csv` on FATFS.
 It restores valid entries during boot.
 It removes entries older than six hours when it rewrites the file.

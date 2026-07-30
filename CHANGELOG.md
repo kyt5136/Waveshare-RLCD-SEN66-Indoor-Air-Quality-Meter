@@ -15,6 +15,8 @@
 - Added OpenWeather 15-minute temperature, rain probability, and alert processing.
 - Added one-time automatic selection of the 60-minute page for each new weather event.
 - Rebuilt the 60-minute page with four measurement boxes, a clock, and battery charge.
+- Set the development-unit battery voltage correction factor to `1.020`.
+- Prevented unqualified raw SHTC3 data from producing steps in the six-hour history.
 
 ## Power and weather revision - 2026-07-29
 

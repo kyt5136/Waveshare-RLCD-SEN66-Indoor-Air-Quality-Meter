@@ -67,9 +67,9 @@ static const uint8_t SEN66_ADDR = 0x6B;
 static const uint8_t SHTC3_ADDR = 0x70;
 
 // Schematic R21/R23 divider: 200 kOhm / 100 kOhm, therefore VBAT = VADC * 3.
-// Leave this at 1.000 until a rested-cell reading is compared with a DMM.
+// This unit reads correctly at 1.020 after comparison with a DMM.
 static constexpr float BATTERY_DIVIDER_RATIO = 3.0f;
-static constexpr float BATTERY_CALIBRATION = 1.000f;
+static constexpr float BATTERY_CALIBRATION = 1.020f;
 static constexpr float EXTERNAL_POWER_ENTER_V = 4.18f;
 static constexpr float EXTERNAL_POWER_EXIT_V = 4.12f;
 static constexpr unsigned long DISPLAY_UPDATE_MS = 2000UL;  // 0.5 Hz
@@ -1182,6 +1182,30 @@ void appendHistoryPoint(float temperatureF, float relativeHumidity) {
   history.initialized = history.sampleCount >= HISTORY_SIZE;
   history.lastLogTime = millis();
   persistHistory();
+}
+
+float historyTemperatureC() {
+  if (sen66MeasurementRunning && indoor.valid) return indoor.temperature;
+  if (sensorComparison.qualified && sensorComparison.shtc3Valid) {
+    return sensorComparison.shtc3Temperature +
+           sensorComparison.meanTempDeltaC;
+  }
+  if (indoor.valid) return indoor.temperature;
+  if (sensorComparison.shtc3Valid) return sensorComparison.shtc3Temperature;
+  return temperature;
+}
+
+float historyRelativeHumidity() {
+  if (sen66MeasurementRunning && indoor.valid) return indoor.humidity;
+  if (sensorComparison.qualified && sensorComparison.shtc3Valid) {
+    return constrain(
+      sensorComparison.shtc3Humidity +
+      sensorComparison.meanHumidityDelta,
+      0.0, 100.0);
+  }
+  if (indoor.valid) return indoor.humidity;
+  if (sensorComparison.shtc3Valid) return sensorComparison.shtc3Humidity;
+  return humidity;
 }
 
 void loadHistory() {
@@ -4745,7 +4769,7 @@ void setup() {
 
   loadHistory();
   if (history.sampleCount == 0 && (indoor.valid || sensorComparison.shtc3Valid))
-    appendHistoryPoint(cToF(temperature), humidity);
+    appendHistoryPoint(cToF(historyTemperatureC()), historyRelativeHumidity());
   serviceDisplayPowerMode();
   beepBootOk();
   Serial.println("Ready!");
@@ -4800,7 +4824,7 @@ void loop() {
   }
 
   if (now - history.lastLogTime >= HISTORY_UPDATE_MS)
-    appendHistoryPoint(cToF(temperature), humidity);
+    appendHistoryPoint(cToF(historyTemperatureC()), historyRelativeHumidity());
 
   // Web UI triggered actions (set by handlers, actioned here on main thread)
   if (webRefreshWeather) { webRefreshWeather = false; if (wifiConnected) fetchAllOnlineData(); }

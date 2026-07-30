@@ -29,7 +29,8 @@ The firmware averages 32 calibrated ADC samples. It removes the highest and lowe
 
 The prior equation also used a 1.079 multiplier. That multiplier could show 4.4 V from a safe cell voltage.
 
-`BATTERY_CALIBRATION` has a default value of `1.000`. Change this value only after a digital multimeter comparison.
+`BATTERY_CALIBRATION` has a calibrated value of `1.020` for the development unit.
+Confirm this value with a digital multimeter when you use different hardware.
 
 Use this calibration procedure:
 
