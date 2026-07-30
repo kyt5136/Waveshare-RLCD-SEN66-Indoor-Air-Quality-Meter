@@ -4,11 +4,25 @@
 
 The firmware has an external-power mode and a low-power mode.
 
-The board does not route USB VBUS to an ESP32 input. Software cannot detect all USB power sources directly.
+The Arduino build uses the ESP32-S3 hardware USB CDC interface.
+The firmware checks `Serial.isPlugged()` for USB start-of-frame activity.
 
-The firmware uses battery voltage with hysteresis. It enters external-power mode at 4.18 V. It enters low-power mode at 4.12 V.
+The firmware samples USB status every 250 milliseconds.
+It confirms a connection after 250 milliseconds.
+It confirms a disconnection after two seconds.
 
-A full cell can keep external-power mode active after USB removal. This condition ends when the cell voltage reaches 4.12 V.
+USB host detection is the only automatic external-power input.
+Battery voltage does not select external-power mode.
+A full battery and a charging battery can have the same voltage.
+
+A charge-only USB supply does not provide USB host activity.
+The firmware uses low-power mode with that supply.
+This fail-safe choice protects battery runtime after USB removal.
+
+The board schematic does not route VBUS or charger status to a dedicated ESP32 input.
+A future hardware revision should add a divided VBUS input or a charger-status input.
+
+Reference: [Waveshare ESP32-S3-RLCD-4.2 schematic](https://files.waveshare.com/wiki/ESP32-S3-RLCD-4.2/ESP32-S3-RLCD-4.2-schematic.pdf).
 
 ## Battery measurement
 
@@ -24,7 +38,8 @@ The firmware averages 32 calibrated ADC samples. It removes the highest and lowe
 
 The prior equation also used a 1.079 multiplier. That multiplier could show 4.4 V from a safe cell voltage.
 
-`BATTERY_CALIBRATION` has a default value of `1.000`. Change this value only after a digital multimeter comparison.
+`BATTERY_CALIBRATION` has a calibrated value of `1.020` for the development unit.
+Confirm this value with a digital multimeter when you use different hardware.
 
 Use this calibration procedure:
 
@@ -84,13 +99,15 @@ External-power mode keeps Wi-Fi available.
 
 Low-power mode disables Wi-Fi between update windows. The normal update interval is 30 minutes.
 
-The firmware uses two OpenWeather calls per update. One call gets the minute forecast. One call gets outdoor air data.
+The firmware uses three OpenWeather calls per update.
+The calls get one-minute precipitation, 15-minute conditions and alerts, and outdoor air data.
 
 If rain occurs in the next 30 minutes, the interval changes to 10 minutes. This mode lasts for two hours.
 
 The same rain event cannot start another two-hour period. A dry forecast arms the next rain event.
 
-Continuous 10-minute operation uses 288 OpenWeather calls per day. The firmware stops OpenWeather calls at 900 calls per day.
+Continuous 10-minute operation uses 432 OpenWeather calls per day.
+The firmware stops OpenWeather calls at 900 calls per day.
 
 WeatherAPI remains the source for the three-day forecast, astronomy data, pressure, and location time data.
 
@@ -104,17 +121,45 @@ Hold GPIO 0 for one second to start a five-minute Wi-Fi window. A short press ch
 
 Either button can wake the ESP32-S3 from light sleep. The firmware uses GPIO wake for both digital inputs.
 
+Each button press starts a 60-second interaction window.
+The window keeps the ESP32-S3 awake and selects ST7305 high-power mode.
+
 Do not hold GPIO 0 during reset. The ESP32-S3 can enter its download mode.
 
 ## Display and CPU sleep
 
-The firmware limits normal display writes to 0.5 Hz.
+The firmware limits low-power display writes to 0.5 Hz.
+It permits 4 Hz writes during the interaction window or external power.
+The ST7305 uses high-power mode during this window.
+It returns to 0.5 Hz low-power mode after the window.
+External power keeps the ST7305 in high-power mode.
 
 The display schedule sends the ST7305 sleep command after the firmware blanks the display. The wake path sends the ST7305 wake command.
 
-Low-power mode uses 200 ms light-sleep intervals between work. Wi-Fi, alarms, timers, and CO2 calibration prevent light sleep.
+Low-power mode uses 200 ms light-sleep intervals between work.
+Wi-Fi, alarms, timers, CO2 calibration, and the interaction window prevent light sleep.
 
 The reflective display has no backlight. The ESP32-S3 and SEN66 remain the primary battery loads.
+
+## Recommended power work
+
+Add a divided VBUS signal to a spare GPIO in the next board revision.
+This signal gives a direct external-power state without an active USB host.
+
+Add the charger status signal if the firmware must show the charge state.
+Do not use the charger status signal as the only external-power signal.
+
+Replace the fixed 200 ms sleep interval with a deadline-based sleep interval.
+Wake only for a button, a sensor deadline, a network deadline, or a timer event.
+
+Render a page only when its visible data changes.
+Update the clock once each minute on pages that do not show seconds.
+
+Disable the audio circuit between alerts if the hardware provides a power control.
+Measure the disabled current before this control becomes part of the power budget.
+
+Use late SEN66 samples for the SHTC3 correction model.
+This rule reduces the effect of sensor warm-up on the temperature difference.
 
 ## Network setup portal
 

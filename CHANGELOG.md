@@ -1,5 +1,37 @@
 # Change Log
 
+## LCD design standard and USB power detection - 2026-07-29
+
+- Added one reusable black header with a fixed page title and local time.
+- Applied the header to all 14 LCD pages.
+- Removed location coordinates and location strings from LCD headers.
+- Added bold label and value fonts for better one-bit display legibility.
+- Standardized the measurement-box labels, baselines, spacing, and units.
+- Moved `ppm` into the CO2 labels to permit larger CO2 values.
+- Added an LCD design standard for the future ESP-IDF port.
+- Removed battery voltage as an automatic external-power signal.
+- Added USB host connection and disconnection confirmation periods.
+- Set low-power mode within two seconds after USB host removal.
+- Reduced the current value size on both indoor history pages.
+
+## Display, sensor comparison, and startup diagnostics - 2026-07-29
+
+- Added a complete startup scan for I2C addresses `0x01` through `0x7E`.
+- Added expected, missing, unknown, and bus-error classifications to the serial log.
+- Added a 60-second ST7305 high-power interaction window after each button press.
+- Set the ST7305 low-power frame rate to 0.5 Hz.
+- Added ESP32-S3 hardware USB host detection.
+- Added 15-second SHTC3 readings and paired SEN66 comparison logging.
+- Added 12-hour offset qualification with one-standard-deviation update gates.
+- Added corrected SHTC3 fallback data while the SEN66 is idle.
+- Added persistent FATFS storage for sensor comparison data and six-hour history.
+- Added three-decimal battery voltage to each serial sensor update.
+- Added OpenWeather 15-minute temperature, rain probability, and alert processing.
+- Added one-time automatic selection of the 60-minute page for each new weather event.
+- Rebuilt the 60-minute page with four measurement boxes, a clock, and battery charge.
+- Set the development-unit battery voltage correction factor to `1.020`.
+- Prevented unqualified raw SHTC3 data from producing steps in the six-hour history.
+
 ## Power and weather revision - 2026-07-29
 
 - Replaced the battery ADC equation with calibrated millivolt sampling and the board divider ratio.

@@ -4,13 +4,14 @@
 
 The firmware is a single Arduino sketch with local companion files. It deliberately avoids a dynamic UI framework. Every LCD page is rendered into an Adafruit `GFXcanvas1` buffer and then transferred to the Waveshare reflective LCD through the board-specific ESP-IDF panel interface.
 
-The design is organized around five operating domains:
+The design is organized around six operating domains:
 
 1. acquisition of indoor SEN66 measurements.
 2. acquisition and reduction of WeatherAPI and OpenWeather data.
 3. timekeeping using NTP and the PCF85063A RTC.
 4. deterministic monochrome page rendering.
 5. local control through hardware buttons and an embedded HTTP server.
+6. FATFS logging and persistent sensor history.
 
 ## 2. Main software components
 
@@ -29,17 +30,20 @@ The implemented startup sequence is:
 
 1. initialize Serial at 115200 baud.
 2. load persistent settings from NVS namespace `dash`.
-3. initialize the shared I2C controller on GPIO 13/14.
-4. initialize ES8311/I2S audio.
-5. initialize the RLCD display interface.
-6. initialize the PCF85063A RTC.
-7. reset the SEN66, restore the VOC state, and start measurement.
-8. connect to the configured 2.4 GHz Wi-Fi network.
-9. start the embedded HTTP server.
-10. retrieve WeatherAPI and OpenWeather data.
-11. synchronize UTC from NTP and write location-local time to the RTC.
-12. acquire the first SEN66 measurement.
-13. initialize history buffers, battery state, and audio indications.
+3. detect a connected USB host.
+4. initialize the shared I2C controller on GPIO 13/14.
+5. scan all usable I2C addresses and classify each responder.
+6. mount the FATFS partition.
+7. initialize ES8311/I2S audio.
+8. initialize the RLCD display interface.
+9. initialize the PCF85063A RTC.
+10. reset the SEN66, restore the VOC state, and start measurement.
+11. connect to the configured 2.4 GHz Wi-Fi network.
+12. start the embedded HTTP server.
+13. retrieve WeatherAPI and OpenWeather data.
+14. synchronize UTC from NTP and write location-local time to the RTC.
+15. acquire the first SHTC3 and SEN66 measurements.
+16. restore six-hour history and start the audio indication.
 
 Failures are reported on Serial and reflected in display state. Wi-Fi or remote-weather failure does not prevent indoor sensing and local display operation.
 
@@ -51,23 +55,33 @@ The main Arduino loop is cooperative. There is no application-created FreeRTOS t
 |---|---|
 | 1 s | SEN66 processed measurement |
 | 10 s | battery ADC |
+| 15 s | SHTC3 temperature and humidity |
 | 15 min | temperature/humidity history insertion |
+| 250 ms | USB host-state sample |
 | 30 min | WeatherAPI update |
 | 30 min | Normal OpenWeather update |
 | 10 min | OpenWeather update during a two-hour rain event |
-| 2 s | Maximum LCD update rate |
+| 250 ms | Maximum LCD update rate during button interaction |
+| 2 s | Maximum LCD update rate outside button interaction |
 | 24 h | NTP/RTC synchronization |
 | configurable | automatic page change |
 
 The ESP32 networking and web-server implementation uses framework facilities underneath the sketch. Application code remains single-threaded from the sketch's perspective. Web handlers set flags for operations that should run from the main loop rather than performing every long operation inside the HTTP callback.
 
+All LCD pages use the shared frame and typography rules in [the LCD user interface design standard](UI_DESIGN_STANDARD.md).
+
 ## 5. Data ownership
 
 ### Indoor state
 
-`Sen66Data indoor` is the only authoritative indoor measurement record. It contains all processed SEN66 channels, calculated particle AQI, a valid flag, last-update time, and serial number.
+`Sen66Data indoor` contains all processed SEN66 channels.
+It also contains particle AQI, validity, update time, and the serial number.
 
-Legacy scalar variables `temperature` and `humidity` mirror the latest SEN66 values for history-page compatibility. The onboard SHTC3 is not used as an indoor source.
+The `temperature` and `humidity` variables select the active display source.
+They use SEN66 data while the SEN66 measures.
+They use corrected SHTC3 data while the SEN66 is idle.
+
+`SensorComparisonState sensorComparison` owns the paired statistics and qualification state.
 
 ### Outdoor state
 
@@ -82,6 +96,9 @@ The WeatherAPI response is reduced immediately. the original JSON body is not re
 
 ESP32 `Preferences` uses namespace `dash`. Persisted configuration is listed in [WEB_INTERFACE.md](WEB_INTERFACE.md).
 
+FATFS stores `/sensor_compare.csv` and `/history.csv`.
+NVS stores the sensor-comparison model and the SEN66 VOC state.
+
 ## 6. Display pipeline
 
 1. The selected page draws into a 400 x 300 one-bit `GFXcanvas1`.
@@ -91,7 +108,9 @@ ESP32 `Preferences` uses namespace `dash`. Persisted configuration is listed in 
 
 The low-level driver allocates PSRAM for its display buffer and pixel lookup tables. The application canvas consumes approximately 15,000 bytes before library overhead.
 
-The reflective LCD holds its image without a backlight. The firmware limits display writes to 0.5 Hz.
+The reflective LCD holds its image without a backlight.
+Low-power mode uses 0.5 Hz display writes.
+A button press starts a 60-second high-power interaction window.
 
 The display schedule sends ST7305 sleep and wake commands. Low-power mode also uses ESP32-S3 light sleep.
 

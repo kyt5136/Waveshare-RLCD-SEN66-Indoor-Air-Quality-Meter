@@ -42,6 +42,11 @@ Relative to the cited weather-dashboard baseline, this project introduces or mat
 - timer, stopwatch, alarm, snooze, and audio behavior.
 - ESP32-hosted control interface.
 - NVS-backed weather location, display, audio, sleep, cycling, alarms, and page-mask settings.
+- SHTC3 comparison, 12-hour offset qualification, and corrected fallback measurements.
+- FATFS sensor-pair logging and persistent six-hour history.
+- ST7305 high-power interaction windows and 0.5 Hz low-power operation.
+- USB host detection through the ESP32-S3 hardware CDC interface.
+- complete startup I2C inventory and expected-device classification.
 - six-hour epoch-based forecast selection across midnight.
 - page-filtered manual and automatic navigation.
 - technical, operational, data-quality, and security documentation.
@@ -51,10 +56,12 @@ Relative to the cited weather-dashboard baseline, this project introduces or mat
 | Source | Use |
 |---|---|
 | [Waveshare ESP32-S3-RLCD-4.2 documentation](https://docs.waveshare.com/ESP32-S3-RLCD-4.2) | board capabilities, resources, handling precautions, and vendor setup references |
-| [Waveshare ESP32-S3-RLCD-4.2 schematic](https://files.waveshare.com/wiki/ESP32-S3-RLCD-4.2/ESP32-S3-RLCD-4.2-schematic.pdf) | GPIO 4 battery divider values and board power connections |
+| [Waveshare ESP32-S3-RLCD-4.2 schematic](https://files.waveshare.com/wiki/ESP32-S3-RLCD-4.2/ESP32-S3-RLCD-4.2-schematic.pdf) | GPIO assignments, I2C devices, battery divider values, and board power connections |
+| [ST7305 controller datasheet](https://files.waveshare.com/wiki/common/ST_7305_V0_2.pdf) | high-power command, low-power command, frame-rate control, and sleep sequence |
+| [Sensirion SHTC3 datasheet](https://sensirion.com/en/media/documents/643F9C8E/63A5A436/Datasheet_SHTC3.pdf) | address, wake, sleep, measurement command, conversion formulas, and CRC |
 | [Sensirion SEN6x datasheet](https://sensirion.com/media/documents/FAFC548D/693FBB15/PS_DS_SEN6x.pdf) | SEN66 signals, I2C behavior, electrical/operating requirements, and measurement semantics |
 | [WeatherAPI documentation](https://www.weatherapi.com/docs/) | forecast endpoint, response fields, astronomy, hourly data, and air-quality response |
-| [OpenWeather One Call 4.0](https://openweathermap.org/api/one-call-4) | 60-minute precipitation timeline, endpoint limits, and update guidance |
+| [OpenWeather One Call 4.0](https://openweathermap.org/api/one-call-4) | one-minute precipitation, 15-minute conditions, alerts, endpoint limits, and update guidance |
 | [OpenWeather Air Pollution API](https://openweathermap.org/api/air-pollution) | outdoor PM2.5 and PM10 concentrations |
 | [Arduino-ESP32 ADC API](https://docs.espressif.com/projects/arduino-esp32/en/latest/api/adc.html) | calibrated ADC millivolt conversion |
 | [ESP32-S3 sleep modes](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/system/sleep_modes.html) | light-sleep timer wake and digital GPIO wake |
