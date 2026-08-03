@@ -104,6 +104,7 @@ Namespace: `dash`
 | `cycle_en` | bool | automatic page cycling |
 | `cycle_sec` | int | cycle dwell |
 | `page_mask` | unsigned short | per-page inclusion bit mask |
+| `page_schema` | byte | page-mask migration version; current value is 3 |
 | `sleep_en` | bool | display-sleep schedule enabled |
 | `sleep_from` | int | sleep start hour |
 | `sleep_to` | int | wake hour |
@@ -128,7 +129,18 @@ Runtime countdown and stopwatch progress are not persisted across reset.
 - At least one page must remain checked.
 - Alarm or timer activation can force page 13.
 
-## 8. Audio separation
+## 8. On-device settings page
+
+Page 14 provides the same local maintenance path when the web interface is not
+available. Hold BOOT/GPIO 0 to select an item, tap KEY/GPIO 18 to apply it, and
+hold KEY to continue navigation. The choices open the five-minute Wi-Fi window,
+start CO2 calibration, or request SEN66 fan cleaning.
+
+The web CO2 path requires current online pressure. The on-device path may begin
+offline without pressure compensation, so the web path is preferred when
+connectivity is available.
+
+## 9. Audio separation
 
 `beep_en` controls page-change clicks only.
 
@@ -136,7 +148,7 @@ Runtime countdown and stopwatch progress are not persisted across reset.
 
 Both flags are persistent. Disabling either flag does not remove the relevant visual state.
 
-## 9. Recommended hardening
+## 10. Recommended hardening
 
 For any network other than a controlled home/lab LAN:
 
@@ -148,7 +160,7 @@ For any network other than a controlled home/lab LAN:
 - Change state control endpoints to authenticated POST requests.
 - Apply request-rate limits.
 
-## 10. Low-power web access
+## 11. Low-power web access
 
 The firmware turns Wi-Fi off between remote data updates in low-power mode.
 
@@ -156,7 +168,7 @@ Hold GPIO 0 for one second to start a five-minute Wi-Fi window.
 
 The web interface is unavailable after that window closes.
 
-## 11. Setup access point
+## 12. Setup access point
 
 The firmware starts `SEN66-Setup` for ten minutes after a failed startup connection.
 

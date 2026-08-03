@@ -82,6 +82,10 @@ Verify:
 15. A short GPIO 0 press selects the previous page.
 16. A one-second GPIO 0 hold starts a five-minute Wi-Fi window.
 17. `secrets.h` remains untracked.
+18. The startup I2C scan identifies `0x6B` as SEN66 and `0x70` as the onboard SHTC3; investigate missing or unknown addresses before enclosure closure.
+19. Page 14 accepts hold BOOT to select and tap KEY to apply Wi-Fi, CO2 calibration, and fan clean-out actions.
+20. Indoor AQI stays `--` for the 10-second PM warm-up period after an SEN66 start or fan clean-out, then appears without a single-frame spike.
+21. After at least 12 hours, confirm the System Information page reports the SHTC3 comparison as qualified before relying on an SEN66-off fallback value.
 
 ### Forced CO2 calibration
 
@@ -163,6 +167,23 @@ Low-power mode closes Wi-Fi after five minutes. This behavior is intentional.
 - keep the CO2 reading continuously between 350 and 450 ppm for five minutes.
 - move people and combustion sources away from the sensor.
 - do not expect the device to infer outdoor placement from its measurements.
+
+### SHTC3 comparison or history is unavailable
+
+- inspect the boot log for the `0x70` SHTC3 response and CRC/read errors.
+- confirm the configured FATFS partition is available and has no data that must
+  be preserved before allowing the firmware's format-recovery path.
+- allow 12 hours and at least 100 valid paired samples before expecting a
+  qualified correction.
+- treat the fallback as continuity data only; repair the SEN66 path rather than
+  relying on it indefinitely.
+
+### Fan clean-out fails or AQI remains unavailable
+
+- wait for the reported clean-out completion before restarting another action.
+- allow the mandatory 10-second PM warm-up after clean-out or a normal SEN66 restart.
+- inspect Serial for a Sensirion error code and confirm continuous measurement
+  can be started normally.
 
 ## 5. Update discipline
 

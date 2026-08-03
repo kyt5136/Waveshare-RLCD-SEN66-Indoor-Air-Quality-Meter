@@ -45,6 +45,8 @@ Relative to the cited weather-dashboard baseline, this project introduces or mat
 - six-hour epoch-based forecast selection across midnight.
 - page-filtered manual and automatic navigation.
 - technical, operational, data-quality, and security documentation.
+- SHTC3/SEN66 comparison logging, FATFS history persistence, PM conditioning,
+  on-device maintenance settings, and weather-event presentation.
 
 ## 4. Hardware and protocol sources
 

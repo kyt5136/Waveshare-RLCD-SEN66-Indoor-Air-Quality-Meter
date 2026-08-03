@@ -6,9 +6,11 @@ The firmware has an external-power mode and a low-power mode.
 
 The board does not route USB VBUS to an ESP32 input. Software cannot detect all USB power sources directly.
 
-The firmware uses battery voltage with hysteresis. It enters external-power mode at 4.18 V. It enters low-power mode at 4.12 V.
-
-A full cell can keep external-power mode active after USB removal. This condition ends when the cell voltage reaches 4.12 V.
+When the selected Arduino USB configuration exposes `Serial.isPlugged()`, the
+firmware uses that debounced host-connection state as the external-power
+signal. Battery voltage is not used to infer USB power because a full cell is
+ambiguous. Boards/configurations that do not expose this signal remain in
+low-power mode.
 
 ## Battery measurement
 
@@ -80,17 +82,24 @@ The forced CO2 calibration overrides the duty cycle. The SEN66 stays active duri
 
 ## Wi-Fi schedule
 
-External-power mode keeps Wi-Fi available.
+External-power mode keeps Wi-Fi available and uses a ten-minute online refresh
+interval.
 
 Low-power mode disables Wi-Fi between update windows. The normal update interval is 30 minutes.
 
-The firmware uses two OpenWeather calls per update. One call gets the minute forecast. One call gets outdoor air data.
+The firmware uses three OpenWeather calls per update: one-minute timeline,
+15-minute timeline, and outdoor air data.
+
+The current revision also requests the 15-minute One Call timeline for outside
+temperature, precipitation probability, and alert identifiers. A new rain or
+changed alert can show the 60-minute page once when that page is enabled. It
+does not replace official severe-weather alerting.
 
 If rain occurs in the next 30 minutes, the interval changes to 10 minutes. This mode lasts for two hours.
 
 The same rain event cannot start another two-hour period. A dry forecast arms the next rain event.
 
-Continuous 10-minute operation uses 288 OpenWeather calls per day. The firmware stops OpenWeather calls at 900 calls per day.
+Continuous 10-minute operation uses 432 OpenWeather calls per day. The firmware stops OpenWeather calls at 900 calls per day.
 
 WeatherAPI remains the source for the three-day forecast, astronomy data, pressure, and location time data.
 
@@ -108,7 +117,8 @@ Do not hold GPIO 0 during reset. The ESP32-S3 can enter its download mode.
 
 ## Display and CPU sleep
 
-The firmware limits normal display writes to 0.5 Hz.
+The firmware limits normal battery-mode display writes to 0.5 Hz. USB power or
+any button press enables a 60-second interactive window with up to 4 Hz updates.
 
 The display schedule sends the ST7305 sleep command after the firmware blanks the display. The wake path sends the ST7305 wake command.
 

@@ -35,6 +35,10 @@ Primary manufacturer reference: [Waveshare ESP32-S3-RLCD-4.2 documentation](http
 | I2S data out | 8 | output |
 | I2S MCLK | 16 | output |
 
+The shared I2C scan also recognizes the board's SHTC3 at `0x70`, ES8311 at
+`0x18`, ES7210 at `0x40`, and PCF85063A at `0x51`. Those addresses are board
+diagnostics; the external SEN66 remains the intended source for indoor air data.
+
 These assignments are board-specific. Do not transplant the sketch to a generic ESP32-S3 board without reconciling its schematic and strapping pins.
 
 ## 3. SEN66 interface
@@ -111,3 +115,10 @@ The firmware disables Wi-Fi between scheduled requests. A GPIO 0 hold starts a f
 The audio amplifier enters shutdown after each sound. The display schedule uses the ST7305 sleep command.
 
 Measure current at the battery terminals before you make a battery-life claim.
+
+## 9. Storage use
+
+The selected FATFS partition stores `/history.csv` and the SHTC3/SEN66
+comparison log. The log is rotated at 4 MiB. A failed initial mount causes the
+firmware to attempt a FATFS format and remount, which can remove data in that
+partition. Do not share it with irreplaceable user files.
