@@ -39,6 +39,9 @@ authentication and request-origin protection.
 | `/co2cal/start` (POST) | `confirmed=true` | downloads pressure and begins the guarded five-minute outdoor calibration |
 | `/co2cal/cancel` (POST) | none | cancels qualification before the FRC write starts |
 | `/co2cal/status` (GET) | none | returns calibration state, countdown, CO2, pressure, and reference-band status |
+| `/recovery/start` (POST) | `confirmed=true`, per-boot `token` | downloads pressure and begins the one-hour Recovery Tool sequence |
+| `/recovery/cancel` (POST) | per-boot `token` | cancels conditioning or observation; it cannot interrupt an active FRC write |
+| `/recovery/status` (GET) | none | returns phase timing, pressure, one-time FRC result, and observation statistics |
 | `/syncntp` | none | schedules NTP synchronization |
 | `/setsleep` | schedule arguments | stores display-sleep configuration |
 | `/wakenow` | none | temporarily wakes the display |
@@ -91,6 +94,39 @@ whether it is physically outdoors or whether the reference atmosphere is
 traceable. The returned correction and failure state are shown in the web
 status text and Serial Monitor.
 
+### Recovery Tool
+
+Recovery Tool is a separate field-recovery path for a persistently high outdoor
+CO2 reading that cannot enter the standard 350-450 ppm qualification band. It:
+
+1. Requires explicit outdoor-placement and persistent-FRC confirmation.
+2. Rejects startup during standard CO2 calibration or fan cleaning.
+3. Requires a valid CO2 frame, active Wi-Fi, fresh WeatherAPI pressure, and an
+   accepted SEN66 pressure-compensation command.
+4. Forces high-power operation and continuous SEN66 measurement for 30 minutes.
+5. Stops measurement, waits 1500 ms, and writes exactly one 400 ppm FRC without
+   requiring the pre-FRC reading to enter the normal qualification band.
+6. Restarts continuous measurement and observes for another 30 minutes.
+7. Reports initial and pre-FRC CO2, correction, valid sample count, minimum,
+   maximum, integer average, final reading, and percentage within 350-450 ppm.
+8. Releases the high-power override after completion, cancellation, failure, or
+   restart.
+
+The state is intentionally not stored in NVS. A restart cancels an unfinished
+run and prevents an automatic FRC after reboot. The exception is a safety latch
+written immediately before the FRC command: if the command response is lost,
+the latch survives reboot and blocks another Recovery Tool run because the
+persistent calibration outcome is unknown. Manual sensor service is required
+before clearing that condition. Cancellation before FRC writes no calibration.
+Cancellation during observation leaves the already completed persistent FRC in
+place. The device rejects cancellation during the short FRC write.
+
+Start and cancel require a random per-boot request token embedded in the root
+page. This prevents a third-party page from submitting the predictable recovery
+POST request through ordinary cross-site request forgery. It is not user
+authentication and does not protect traffic from another device already able to
+observe the unencrypted LAN session.
+
 ## 6. NVS namespace
 
 Namespace: `dash`
@@ -118,6 +154,7 @@ Namespace: `dash`
 | `alN_en` | bool | alarm enabled |
 | `tmr_name` | string | timer label |
 | `tmr_dur` | unsigned int | timer duration |
+| `rec_frc_unknown` | bool | blocks another recovery when an FRC command outcome could not be confirmed |
 
 Runtime countdown and stopwatch progress are not persisted across reset.
 

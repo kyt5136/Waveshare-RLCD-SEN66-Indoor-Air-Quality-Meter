@@ -67,6 +67,7 @@ The ESP32 serves an unauthenticated HTTP interface on its LAN address. Available
 
 - immediate WeatherAPI and OpenWeather refresh
 - guarded outdoor SEN66 forced-CO2 recalibration using freshly downloaded local pressure
+- one-hour Recovery Tool with a 30-minute continuous conditioning period, one 400 ppm FRC, and a 30-minute observation report
 - immediate NTP synchronization
 - weather location replacement using decimal `latitude,longitude`
 - automatic LCD page cycling and dwell time
@@ -153,6 +154,8 @@ The display driver allocates its frame buffer and lookup tables in PSRAM. A buil
 | SEN66 read while active | 1 second |
 | SEN66 low-power duty cycle | 90 seconds per 10-minute slot |
 | SEN66 hourly conditioning | minute 50 through minute 59 |
+| Recovery Tool conditioning | 30 minutes continuous measurement |
+| Recovery Tool observation | 30 minutes continuous measurement after one FRC |
 | Battery ADC read | 10 seconds |
 | Temperature/humidity history sample | 15 minutes |
 | History capacity | 24 samples / 6 hours |
@@ -193,6 +196,9 @@ No project-wide open-source license is asserted here because the immediate upstr
 - CO2, VOC, and NOx outputs require sensor startup and conditioning time.
 - Forced CO2 recalibration is persistent. Use the web workflow only with the
   complete SEN66 outdoors in a homogeneous, known 400 ppm reference environment.
+- Recovery Tool deliberately bypasses the normal 350-450 ppm prequalification
+  gate. It is a field-recovery aid for a persistently offset reading, not a
+  substitute for certified calibration gas or a reference instrument.
 - Battery state of charge uses voltage. It is not a coulomb-counted result.
 - The fan clean-out and smoothed, current-sample AQI are maintenance and trend tools; they do not make this a reference or life-safety monitor.
 - The web interface must not be exposed directly to the public internet.

@@ -21,6 +21,25 @@ arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=ap
 
 The generic FQBN validation checks compilation. Deployment still requires the Waveshare-appropriate flash, PSRAM, USB, and partition selections in Arduino IDE.
 
+Recovery Tool state validation uses a host C++ compiler and does not require
+hardware:
+
+```powershell
+New-Item -ItemType Directory -Force build/tests | Out-Null
+g++ -std=c++17 -Wall -Wextra -Werror tests/recovery_tool_state_test.cpp -o build/tests/recovery_tool_state_test.exe
+build/tests/recovery_tool_state_test.exe
+```
+
+For hardware CDC upload and Serial verification, the validated CLI profile is:
+
+```powershell
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,USBMode=hwcdc,CDCOnBoot=cdc" --output-dir build/recovery-tool firmware/weather_dash
+arduino-cli upload --port COM8 --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,USBMode=hwcdc,CDCOnBoot=cdc" --input-dir build/recovery-tool firmware/weather_dash
+```
+
+Replace `COM8` with the currently enumerated USB CDC port. Confirm the target
+port immediately before upload.
+
 ## 2. Clean checkout preparation
 
 1. Install Arduino IDE and the Espressif ESP32 board package.
@@ -111,6 +130,38 @@ configuration and survives reset or power loss. Ordinary outdoor air is not a
 traceable 400 ppm calibration gas. use a controlled reference for metrological
 work.
 
+### Recovery Tool for a persistently high outdoor reading
+
+Use Recovery Tool only after ordinary outdoor placement has failed to bring the
+SEN66 into the guarded 350-450 ppm calibration band:
+
+1. Charge the battery sufficiently for at least one hour of continuous SEN66,
+   Wi-Fi, display, and ESP32 operation.
+2. Place the complete unit in open, well-mixed outdoor air away from people,
+   doors, windows, HVAC outlets, combustion sources, and direct wind gusts.
+3. Confirm that the configured WeatherAPI coordinates match the physical site.
+4. Open the root web page, select the Recovery Tool confirmation, and press
+   **Start 1-Hour Recovery**.
+5. Confirm that the state becomes `conditioning`, the displayed pressure is
+   reasonable for the site, and the power mode reads `Recovery high power`.
+6. Disconnect the laptop if desired. Do not remove device power or restart it.
+   Browser and Wi-Fi loss do not stop the in-memory sequence.
+7. Leave the device undisturbed for 30 minutes. Recovery Tool then writes one
+   persistent 400 ppm FRC; it never retries.
+8. Leave the device undisturbed for the full 30-minute `observing` phase.
+9. Review correction, sample count, average, range, in-zone percentage, and
+   final CO2. Preserve these results when deciding whether the sensor requires
+   comparison against a reference instrument or replacement.
+
+A normal 30-minute observation should provide approximately 1800 one-second
+samples. The firmware requires at least 1500; lower coverage is reported as
+`inconclusive`, not complete.
+
+Cancel is safe before FRC and writes no calibration. Cancel after FRC stops the
+observation only; the persistent correction remains. Cancellation is blocked
+while the FRC command is executing. A reboot cancels an incomplete recovery.
+Recovery Tool is a field troubleshooting aid, not a calibration certificate.
+
 ## 4. Common faults
 
 ### SEN66 does not respond at `0x6B`
@@ -167,6 +218,20 @@ Low-power mode closes Wi-Fi after five minutes. This behavior is intentional.
 - keep the CO2 reading continuously between 350 and 450 ppm for five minutes.
 - move people and combustion sources away from the sensor.
 - do not expect the device to infer outdoor placement from its measurements.
+
+### Recovery Tool fails or reports an inconsistent result
+
+- inspect Serial Monitor for `[RECOVERY]`, SEN66, and I2C errors.
+- confirm the initial pressure is 700-1200 hPa and appropriate for the location.
+- confirm the unit remained powered for both 30-minute phases.
+- treat a failed measurement restart as a failure even if the FRC was stored.
+- if the status says the FRC outcome is unknown, do not rerun or reboot around
+  the warning. The persistent command may already have executed; service the
+  CO2 calibration state before clearing the safety latch.
+- do not repeat Recovery Tool automatically; first review its correction and
+  observation statistics.
+- if a factory-default or independently referenced sensor remains hundreds of
+  ppm high, stop field recalibration and investigate replacement.
 
 ### SHTC3 comparison or history is unavailable
 

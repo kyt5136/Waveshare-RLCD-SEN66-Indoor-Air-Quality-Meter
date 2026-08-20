@@ -2,7 +2,8 @@
 
 ## Operating modes
 
-The firmware has an external-power mode and a low-power mode.
+The firmware has an external-power mode, a low-power mode, and a temporary
+Recovery Tool high-power override.
 
 The board does not route USB VBUS to an ESP32 input. Software cannot detect all USB power sources directly.
 
@@ -11,6 +12,11 @@ firmware uses that debounced host-connection state as the external-power
 signal. Battery voltage is not used to infer USB power because a full cell is
 ambiguous. Boards/configurations that do not expose this signal remain in
 low-power mode.
+
+Recovery Tool does not claim that external power is present. While its one-hour
+sequence is active, it explicitly suppresses the low-power sensor schedule,
+display sleep, Wi-Fi shutdown, and ESP32 light sleep. Normal automatic power
+behavior resumes after completion, cancellation, failure, or restart.
 
 ## Battery measurement
 
@@ -80,12 +86,19 @@ The SEN66 interface does not provide a NOx state export command. The firmware ca
 
 The forced CO2 calibration overrides the duty cycle. The SEN66 stays active during the five-minute qualification period.
 
+Recovery Tool keeps the SEN66 active for 30 minutes before its one-time FRC and
+for 30 minutes after measurement restarts. It does not retry FRC.
+
 ## Wi-Fi schedule
 
 External-power mode keeps Wi-Fi available and uses a ten-minute online refresh
 interval.
 
 Low-power mode disables Wi-Fi between update windows. The normal update interval is 30 minutes.
+
+Recovery Tool keeps Wi-Fi available after the online start request so its web
+status remains reachable when the access point is in range. Loss of the browser,
+client laptop, or Wi-Fi connection does not stop the in-memory recovery sequence.
 
 The firmware uses three OpenWeather calls per update: one-minute timeline,
 15-minute timeline, and outdoor air data.

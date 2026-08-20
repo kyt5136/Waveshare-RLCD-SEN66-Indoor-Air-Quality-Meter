@@ -209,6 +209,37 @@ qualification because pressure changes the CO2 measurement. The system cannot
 independently verify outdoor placement or establish a traceable reference-gas
 concentration.
 
+### Recovery Tool field-recovery path
+
+Recovery Tool uses the same pressure validation, 400 ppm FRC target, idle wait,
+failure sentinel, and signed-correction conversion as the guarded calibration.
+Its purpose is different: it deliberately bypasses the 350-450 ppm input gate
+when a persistently offset channel cannot qualify for the normal workflow.
+
+After 30 minutes of continuous pressure-compensated measurement, Recovery Tool
+performs exactly one FRC. It then starts a new 30-minute observation window. Each
+valid reported CO2 sample contributes to:
+
+- sample count;
+- minimum and maximum ppm;
+- integer-average ppm;
+- final ppm; and
+- the percentage of samples from 350 through 450 ppm, inclusive.
+
+A conclusive observation requires at least 1500 valid samples during the
+30-minute window. Fewer samples produce an `inconclusive` result rather than a
+successful completion. The already confirmed FRC remains persistent.
+
+The one-shot rule prevents repeated persistent corrections from compounding an
+error. The observation statistics describe repeatability after FRC; they do not
+establish traceable accuracy. Ordinary outdoor air is not certified 400 ppm gas.
+
+Immediately before sending FRC, the firmware stores an outcome-unknown safety
+latch. A valid correction response clears the latch and confirms application;
+`0xFFFF` clears it and confirms rejection. An I2C receive/CRC error leaves the
+latch set because the command may have executed before its response was lost.
+Recovery Tool will not run again while this condition exists.
+
 ## 10. Hourly selection
 
 The parser scans up to 72 hourly records across the three forecast days. It selects the first six records with `time_epoch` later than the current system epoch. This allows the list to cross midnight rather than restarting at 00:00 or stopping at the end of the first forecast day.

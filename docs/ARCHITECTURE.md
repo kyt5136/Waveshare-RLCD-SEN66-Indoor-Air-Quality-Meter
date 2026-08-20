@@ -57,6 +57,7 @@ The main Arduino loop is cooperative. There is no application-created FreeRTOS t
 | 10 min | OpenWeather update during a two-hour rain event |
 | 2 s | Maximum LCD update rate in low-power mode |
 | 250 ms | Maximum LCD update rate during USB power or the 60-second button-interaction window |
+| 30 min + one FRC + 30 min | Recovery Tool conditioning, calibration, and observation |
 | 24 h | NTP/RTC synchronization |
 | configurable | automatic page change |
 
@@ -83,6 +84,20 @@ New rain or changed severe-weather state may show page 5 once when that page is
 enabled.
 
 The WeatherAPI response is reduced immediately. the original JSON body is not retained after parsing.
+
+### Recovery state
+
+`RecoveryToolState recoveryTool` owns the volatile recovery phase, timestamps,
+pressure, initial/pre-FRC readings, one-time correction result, and observation
+accumulators. Its host-tested transition core emits only two actions: perform
+FRC after 30 minutes of conditioning and finish after 30 minutes of observation.
+
+The surrounding sketch owns I2C, WeatherAPI, web responses, Serial diagnostics,
+and the temporary power override. Ordinary Recovery Tool progress is not stored
+in NVS; restart returns to idle. A separate `rec_frc_unknown` safety latch is
+persisted immediately before FRC and cleared only after a definitive sensor
+response. Standard calibration, Recovery Tool, and fan cleaning are mutually
+exclusive because they share the SEN66 measurement/idle transitions.
 
 ### Persistent state
 

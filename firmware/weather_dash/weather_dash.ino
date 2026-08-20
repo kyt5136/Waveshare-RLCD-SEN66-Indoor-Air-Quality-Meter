@@ -32,6 +32,7 @@
 #include <FFat.h>
 #include <esp_sleep.h>
 #include <driver/gpio.h>
+#include <esp_system.h>
 #include <SensirionI2cSen66.h>
 #include <SensirionCore.h>
 struct AqiBreakpoint;
@@ -40,6 +41,7 @@ struct SeasonEvents;
 struct SeasonInfo;
 #include "display_bsp.h"
 #include "font.h"
+#include "recovery_tool.h"
 #include "secfont.h"
 #include "PCF85063A-SOLDERED.h"
 #include <ESP_I2S.h>   // ESP32 Arduino core 3.x — I2SClass for beep generation
@@ -99,6 +101,7 @@ static constexpr unsigned long FAN_CLEAN_DURATION_MS = 12000UL;  // ~10 s at ful
 
 // Forward declarations for functions defined later in this file.
 void requestWifiWindow(unsigned long durationMs = WIFI_MANUAL_WINDOW_MS);
+void refreshEffectivePowerMode();
 
 
 
@@ -300,6 +303,12 @@ struct Co2CalibrationStatus {
   CO2_CAL_IDLE, 0, NAN, 0,
   "Ready. Move the sensor outdoors before starting."
 };
+
+RecoveryToolState recoveryTool;
+char recoveryToolMessage[320] =
+  "Ready. Recovery Tool has not been started.";
+bool recoveryFrcOutcomeUncertain = false;
+char recoveryCsrfToken[17] = "";
 
 struct HourlyData {
   float  temp[6];
@@ -1488,6 +1497,13 @@ struct FanCleanStatus {
 
 bool startFanCleanProcedure() {
   if (fanClean.state == FAN_CLEAN_RUNNING) return false;
+  if (recoveryTool.active()) {
+    strncpy(fanClean.message,
+            "Recovery Tool must finish or be cancelled first.",
+            sizeof(fanClean.message) - 1);
+    fanClean.message[sizeof(fanClean.message) - 1] = '\0';
+    return false;
+  }
   if (!startSen66Measurement()) {
     fanClean.state = FAN_CLEAN_FAILED;
     strncpy(fanClean.message,
@@ -1531,7 +1547,8 @@ void serviceFanCleaning() {
 }
 
 bool sen66ShouldRunNow() {
-  if (!lowPowerMode || co2Calibration.state == CO2_CAL_STABILIZING ||
+  if (!lowPowerMode || recoveryTool.active() ||
+      co2Calibration.state == CO2_CAL_STABILIZING ||
       co2Calibration.state == CO2_CAL_EXECUTING ||
       fanClean.state == FAN_CLEAN_RUNNING) return true;
 
@@ -1630,6 +1647,11 @@ void executeCo2Calibration() {
 // device menu may proceed offline without pressure compensation.
 bool startCo2CalibrationWorkflow(bool requireOnlinePressure,
                                  char* errBuf, size_t errLen) {
+  if (recoveryTool.active()) {
+    snprintf(errBuf, errLen,
+             "Recovery Tool must finish or be cancelled first.");
+    return false;
+  }
   if (co2Calibration.state == CO2_CAL_STABILIZING ||
       co2Calibration.state == CO2_CAL_EXECUTING) {
     snprintf(errBuf, errLen, "A calibration workflow is already running.");
@@ -1712,6 +1734,212 @@ void serviceCo2Calibration() {
   if (elapsed >= CO2_CAL_STABILIZE_MS) executeCo2Calibration();
 }
 
+bool startRecoveryToolWorkflow(char* errBuf, size_t errLen) {
+  if (recoveryFrcOutcomeUncertain ||
+      recoveryTool.frcOutcome() == RecoveryFrcOutcome::Unknown) {
+    snprintf(errBuf, errLen,
+             "A previous Recovery FRC outcome is unknown. Do not repeat it until the CO2 calibration state is serviced.");
+    return false;
+  }
+  if (recoveryTool.active()) {
+    snprintf(errBuf, errLen, "Recovery Tool is already running.");
+    return false;
+  }
+  if (co2Calibration.state == CO2_CAL_STABILIZING ||
+      co2Calibration.state == CO2_CAL_EXECUTING) {
+    snprintf(errBuf, errLen,
+             "Cancel the standard CO2 calibration before starting Recovery Tool.");
+    return false;
+  }
+  if (fanClean.state == FAN_CLEAN_RUNNING) {
+    snprintf(errBuf, errLen,
+             "Wait for SEN66 fan cleaning to finish before starting Recovery Tool.");
+    return false;
+  }
+  if (!indoor.valid || indoor.co2 == 0xFFFF) {
+    snprintf(errBuf, errLen, "The SEN66 does not have a valid CO2 reading.");
+    return false;
+  }
+  if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
+    snprintf(errBuf, errLen,
+             "Wi-Fi is required at startup to download local pressure.");
+    return false;
+  }
+  if (!fetchWeatherData() || weatherData.pressureHpa < 700.0f ||
+      weatherData.pressureHpa > 1200.0f) {
+    snprintf(errBuf, errLen,
+             "Could not retrieve a valid 700-1200 hPa local pressure from WeatherAPI.");
+    return false;
+  }
+
+  uint16_t pressureHpa = (uint16_t)lroundf(weatherData.pressureHpa);
+  int16_t pressureError = sen66.setAmbientPressure(pressureHpa);
+  if (pressureError != NO_ERROR) {
+    snprintf(errBuf, errLen,
+             "SEN66 rejected pressure compensation (error %d).",
+             pressureError);
+    return false;
+  }
+  if (!startSen66Measurement()) {
+    snprintf(errBuf, errLen,
+             "Could not start continuous SEN66 measurement for Recovery Tool.");
+    return false;
+  }
+  if (!recoveryTool.start(millis(), pressureHpa, indoor.co2)) {
+    snprintf(errBuf, errLen, "Recovery Tool could not enter conditioning.");
+    return false;
+  }
+  refreshEffectivePowerMode();
+
+  snprintf(recoveryToolMessage, sizeof(recoveryToolMessage),
+           "Conditioning continuously for 30 minutes at %u hPa. "
+           "One 400 ppm FRC will run automatically, followed by 30 minutes of observation.",
+           pressureHpa);
+  Serial.printf("[RECOVERY] Started: pressure=%u hPa, initial CO2=%u ppm.\n",
+                pressureHpa, indoor.co2);
+  return true;
+}
+
+void failRecoveryTool(const char* message) {
+  recoveryTool.markFailed(message);
+  refreshEffectivePowerMode();
+  strncpy(recoveryToolMessage, message, sizeof(recoveryToolMessage) - 1);
+  recoveryToolMessage[sizeof(recoveryToolMessage) - 1] = '\0';
+  Serial.printf("[RECOVERY] Failed: %s\n", recoveryToolMessage);
+}
+
+bool persistRecoveryFrcUncertainty(bool uncertain) {
+  bool verified = persistRecoveryFrcLatch(prefs, uncertain);
+  if (verified) {
+    recoveryFrcOutcomeUncertain = uncertain;
+  } else if (!uncertain) {
+    // Clearing failed. Stay conservatively blocked because NVS may still hold
+    // the armed latch even though the sensor response was definitive.
+    recoveryFrcOutcomeUncertain = true;
+  }
+  return verified;
+}
+
+void executeRecoveryToolFrc() {
+  if (!sen66MeasurementRunning || !indoor.valid || indoor.co2 == 0xFFFF ||
+      RecoveryToolState::elapsed(millis(), indoor.lastUpdate) > 10000U) {
+    failRecoveryTool(
+      "Conditioning ended without a recent valid continuous CO2 frame; FRC was not attempted.");
+    return;
+  }
+  uint16_t preFrcCo2 = indoor.valid && indoor.co2 != 0xFFFF ? indoor.co2 : 0;
+  strncpy(recoveryToolMessage,
+          "Applying the one-time 400 ppm forced recalibration...",
+          sizeof(recoveryToolMessage) - 1);
+  recoveryToolMessage[sizeof(recoveryToolMessage) - 1] = '\0';
+  Serial.printf("[RECOVERY] Conditioning complete; pre-FRC CO2=%u ppm.\n",
+                preFrcCo2);
+
+  int16_t stopError = sen66.stopMeasurement();
+  if (stopError != NO_ERROR) {
+    char message[112];
+    snprintf(message, sizeof(message),
+             "Could not stop SEN66 measurement for Recovery Tool (error %d).",
+             stopError);
+    failRecoveryTool(message);
+    return;
+  }
+  sen66MeasurementRunning = false;
+
+  // The current SEN6x datasheet requires at least 1400 ms in idle mode.
+  delay(1500);
+  uint16_t correction = 0;
+  if (!persistRecoveryFrcUncertainty(true)) {
+    failRecoveryTool(
+      "Recovery safety latch could not be written and verified; FRC was not attempted.");
+    int16_t restartError = sen66.startContinuousMeasurement();
+    sen66MeasurementRunning = (restartError == NO_ERROR);
+    if (sen66MeasurementRunning) sen66StartedMs = millis();
+    return;
+  }
+  recoveryTool.markFrcAttempted();
+  int16_t frcError =
+    sen66.performForcedCo2Recalibration(CO2_CAL_TARGET_PPM, correction);
+  int16_t startError = sen66.startContinuousMeasurement();
+  sen66MeasurementRunning = (startError == NO_ERROR);
+  if (sen66MeasurementRunning) sen66StartedMs = millis();
+  indoor.valid = false;
+  lastSensorReadMs = millis();
+
+  if (frcError != NO_ERROR) {
+    char message[256];
+    snprintf(message, sizeof(message),
+             "Recovery FRC response failed (error %d, result 0x%04X); whether the persistent correction was written is unknown. Do not repeat Recovery Tool. Measurement restart: %s.",
+             frcError, correction, startError == NO_ERROR ? "OK" : "FAILED");
+    failRecoveryTool(message);
+    return;
+  }
+  if (correction == 0xFFFF) {
+    bool latchCleared = persistRecoveryFrcUncertainty(false);
+    recoveryTool.markFrcRejected();
+    char message[224];
+    snprintf(message, sizeof(message),
+             "Recovery FRC was rejected (result 0xFFFF). No correction was confirmed. Measurement restart: %s. Safety latch clear: %s.",
+             startError == NO_ERROR ? "OK" : "FAILED",
+             latchCleared ? "OK" : "FAILED; manual service required");
+    failRecoveryTool(message);
+    return;
+  }
+
+  bool latchCleared = persistRecoveryFrcUncertainty(false);
+  recoveryTool.markFrcSucceeded(millis(), correction, preFrcCo2);
+  if (startError != NO_ERROR) {
+    char message[224];
+    snprintf(message, sizeof(message),
+             "Recovery FRC was stored, but measurement restart failed (error %d). Safety latch clear: %s.",
+             startError,
+             latchCleared ? "OK" : "FAILED; manual service required");
+    failRecoveryTool(message);
+    return;
+  }
+
+  int32_t correctionPpm = (int32_t)correction - 0x8000;
+  snprintf(recoveryToolMessage, sizeof(recoveryToolMessage),
+           "One-time FRC complete. Applied correction: %ld ppm. "
+           "Observing continuously for 30 minutes. Safety latch clear: %s.",
+           (long)correctionPpm,
+           latchCleared ? "OK" : "FAILED; manual service required");
+  Serial.printf("[RECOVERY] FRC complete: correction=%ld ppm; observation started.\n",
+                (long)correctionPpm);
+}
+
+void serviceRecoveryTool() {
+  RecoveryAction action = recoveryTool.tick(millis());
+  if (action == RecoveryAction::PerformFrc) {
+    executeRecoveryToolFrc();
+    return;
+  }
+  if (action != RecoveryAction::Finish) return;
+
+  const RecoveryObservation& observation = recoveryTool.observation();
+  const char* latchWarning = recoveryFrcOutcomeUncertain
+    ? " Safety lock remains set because NVS clear verification failed; manual service is required before another recovery."
+    : "";
+  if (recoveryTool.phase() == RecoveryPhase::Inconclusive) {
+    snprintf(recoveryToolMessage, sizeof(recoveryToolMessage),
+             "Recovery observation inconclusive: only %lu of %lu required valid samples. "
+             "The one-time FRC remains stored; do not repeat Recovery Tool automatically.%s",
+             (unsigned long)observation.validSamples,
+             (unsigned long)RECOVERY_MIN_OBSERVATION_SAMPLES,
+             latchWarning);
+  } else {
+    snprintf(recoveryToolMessage, sizeof(recoveryToolMessage),
+             "Recovery complete. %lu samples; average %u ppm; range %u-%u ppm; "
+             "%u%% in the 350-450 ppm zone; final %u ppm.%s",
+             (unsigned long)observation.validSamples,
+             observation.averagePpm(), observation.minimumPpm,
+             observation.maximumPpm, observation.inZonePercent(),
+             observation.finalPpm, latchWarning);
+  }
+  refreshEffectivePowerMode();
+  Serial.printf("[RECOVERY] %s\n", recoveryToolMessage);
+}
+
 // ===== BATTERY =====
 float readBatteryVoltage() {
   // analogReadMilliVolts() uses the ESP32 ADC calibration data. Average 32
@@ -1754,6 +1982,10 @@ void updateBatteryState(float measuredVoltage) {
   batteryStateInitialized = true;
 }
 
+void refreshEffectivePowerMode() {
+  lowPowerMode = !(externalPowerLikely || recoveryTool.active());
+}
+
 void serviceUsbHostState(bool forceCheck = false) {
   unsigned long now = millis();
   if (!forceCheck && now - lastUsbCheckMs < USB_STATUS_SAMPLE_MS) return;
@@ -1789,8 +2021,15 @@ void serviceUsbHostState(bool forceCheck = false) {
 
   // Cell voltage cannot distinguish a full battery from charge-only USB power.
   // Use the hardware USB host signal as the only automatic external-power input.
+  // Recovery Tool is a temporary, explicit high-power override and is never
+  // reported as evidence that external power is present.
   externalPowerLikely = usbHostConnected;
-  lowPowerMode = !externalPowerLikely;
+  refreshEffectivePowerMode();
+}
+
+const char* powerModeName() {
+  if (recoveryTool.active()) return "Recovery high power";
+  return externalPowerLikely ? "External power" : "Low power";
 }
 
 bool displayInteractive() {
@@ -1808,7 +2047,8 @@ void activateDisplayInteractiveWindow() {
 }
 
 void serviceDisplayPowerMode() {
-  bool requestedHighPower = externalPowerLikely || displayInteractive();
+  bool requestedHighPower = externalPowerLikely || recoveryTool.active() ||
+                            displayInteractive();
   if (requestedHighPower == displayHighPower) return;
   RlcdPort.RLCD_SetPowerMode(requestedHighPower);
   displayHighPower = requestedHighPower;
@@ -1825,7 +2065,7 @@ void logBatteryTrend() {
 }
 
 float estimatedHoursTo20Percent() {
-  if (externalPowerLikely || batterySoc <= 20.0f || batteryTrendCount < 5) return NAN;
+  if (!lowPowerMode || batterySoc <= 20.0f || batteryTrendCount < 5) return NAN;
   int oldest = (batteryTrendHead - batteryTrendCount + 48) % 48;
   const BatteryTrendPoint& first = batteryTrend[oldest];
   const BatteryTrendPoint& last =
@@ -1841,6 +2081,7 @@ float estimatedHoursTo20Percent() {
 // Handles midnight-spanning windows (e.g. 23:00 -> 06:00).
 // Overridden to false during the 60-second button interaction window.
 bool isDisplaySleeping() {
+  if (recoveryTool.active()) return false;
   if (!sleepEnabled) return false;
   if (millis() < sleepWakeUntil) return false;
   int h = rtc.getHour();
@@ -2733,7 +2974,8 @@ void drawSystemPage() {
   canvas.print("BATTERY ");
   canvas.print(batteryVoltage, 3); canvas.print(" V  ");
   canvas.print((int)lroundf(batterySoc)); canvas.print("%  ");
-  canvas.print(lowPowerMode ? "LOW POWER" : "EXTERNAL POWER");
+  if (recoveryTool.active()) canvas.print("RECOVERY HIGH POWER");
+  else canvas.print(externalPowerLikely ? "EXTERNAL POWER" : "LOW POWER");
   pushCanvasToRLCD(displayInvert);
 }
 
@@ -3720,6 +3962,7 @@ void nvsLoad() {
   String savedPassword = prefs.getString("wifi_pass", password);
   savedSsid.toCharArray(activeSsid, sizeof(activeSsid));
   savedPassword.toCharArray(activePassword, sizeof(activePassword));
+  recoveryFrcOutcomeUncertain = prefs.getBool("rec_frc_unknown", false);
   if (prefs.getBytesLength("voc_state") == VOC_STATE_SIZE) {
     prefs.getBytes("voc_state", savedVocState, VOC_STATE_SIZE);
     savedVocStateValid = true;
@@ -3750,6 +3993,12 @@ void nvsLoad() {
   swState.startMs = 0;
   prefs.end();
   configureFixedOffsetTimezone(gmtOffset_sec);
+  if (recoveryFrcOutcomeUncertain) {
+    strncpy(recoveryToolMessage,
+            "A previous Recovery FRC outcome is unknown. Do not repeat Recovery Tool until the CO2 calibration state is serviced.",
+            sizeof(recoveryToolMessage) - 1);
+    recoveryToolMessage[sizeof(recoveryToolMessage) - 1] = '\0';
+  }
   if (pageSchema < 3) nvsSave();
 }
 
@@ -3929,7 +4178,7 @@ void handleRoot() {
     "<div class='card'><h2>Battery Estimate</h2><div class='row'>" +
     metric("Battery voltage", String(batteryVoltage, 2)+" V") +
     metric("Estimated charge", String((int)lroundf(batterySoc))+"%") +
-    metric("Power mode", lowPowerMode ? "Low power" : "External power") +
+    metric("Power mode", String(powerModeName())) +
     metric("Estimated time to 20%", runtimeEstimate) +
     "</div><div class='k'>The runtime value uses the measured voltage trend. "
     "The board has no current monitor, so this value is not a coulomb-counted result.</div></div>"
@@ -3960,6 +4209,20 @@ void handleRoot() {
     "<button class='btn' id='cal_start' onclick='startCo2Calibration()'>Start 5-Min Calibration</button>"
     "<button class='btn sec' id='cal_cancel' onclick='cancelCo2Calibration()'>Cancel</button></div>"
     "<div id='cal_status' class='k' style='margin-top:10px'>Loading calibration status...</div></div>"
+    "<div class='card'><h2>Recovery Tool</h2>"
+    "<div class='k'>Diagnostic recovery for a persistently high outdoor CO2 reading. Recovery Tool applies fresh "
+    "local pressure and holds the complete station in high-power operation. It conditions continuously for 30 "
+    "minutes, writes exactly one persistent 400 ppm FRC, then observes continuously for 30 minutes. It never retries FRC.</div>"
+    "<div class='k' style='margin-top:8px'>This is not a traceable calibration-gas procedure. Use it only in open, "
+    "well-mixed outdoor air. Closing the browser or disconnecting the laptop does not stop an active run.</div>"
+    "<div class='sw' style='margin-top:10px'><span class='swlbl'>I confirm outdoor placement and understand that "
+    "one persistent 400 ppm calibration will be written automatically after 30 minutes.</span>"
+    "<label class='switch'><input type='checkbox' id='recovery_outdoor'><span class='slider'></span></label></div>"
+    "<div class='row' style='margin-top:10px'>"
+    "<button class='btn' id='recovery_start' onclick='startRecoveryTool()'>Start 1-Hour Recovery</button>"
+    "<button class='btn sec' id='recovery_cancel' onclick='cancelRecoveryTool()'>Cancel</button></div>"
+    "<div id='recovery_status' class='k' style='margin-top:10px'>Loading Recovery Tool status...</div>"
+    "<div id='recovery_metrics' class='k' style='margin-top:6px'></div></div>"
     "<div class='card'><h2>Weather Location</h2>"
     "<div class='k'>Enter decimal latitude and longitude, for example 40.7128,-74.0060.</div>"
     "<div class='row' style='margin-top:10px'>"
@@ -4020,9 +4283,31 @@ void handleRoot() {
     "let busy=d.state==='stabilizing'||d.state==='calibrating';"
     "document.getElementById('cal_start').disabled=busy;"
     "document.getElementById('cal_cancel').disabled=!busy||d.state==='calibrating';}catch(e){}}"
-    "setInterval(pollCo2Calibration,1000);pollCo2Calibration();"
+    "async function startRecoveryTool(){let s=document.getElementById('recovery_status');"
+    "if(!document.getElementById('recovery_outdoor').checked){s.textContent='Confirm outdoor placement and the one-time persistent FRC first.';return;}"
+    "if(!confirm('Recovery Tool will run high power for about one hour and automatically write one persistent 400 ppm FRC after 30 minutes. Continue?'))return;"
+    "s.textContent='Downloading fresh local pressure...';"
+    "try{let r=await fetch('/recovery/start?confirmed=true&token=" + String(recoveryCsrfToken) + "',{method:'POST'});let t=await r.text();"
+    "if(!r.ok)throw new Error(t);s.textContent=t;pollRecoveryTool()}catch(e){s.textContent=e.message}}"
+    "async function cancelRecoveryTool(){let s=document.getElementById('recovery_status');"
+    "try{let r=await fetch('/recovery/cancel?token=" + String(recoveryCsrfToken) + "',{method:'POST'});let t=await r.text();"
+    "if(!r.ok)throw new Error(t);s.textContent=t;pollRecoveryTool()}catch(e){s.textContent=e.message}}"
+    "async function pollRecoveryTool(){try{let r=await fetch('/recovery/status');let d=await r.json();"
+    "let phase=d.state.charAt(0).toUpperCase()+d.state.slice(1);"
+    "let countdown=d.active&&d.state!=='calibrating'?' Remaining in phase: '+d.remaining_sec+' s.':'';"
+    "document.getElementById('recovery_status').textContent=phase+': '+d.message+countdown+' Live CO2: '+"
+    "(d.co2===null?'--':d.co2)+' ppm; pressure: '+(d.pressure_hpa||'--')+' hPa.';"
+    "let metrics='Initial: '+(d.initial_co2||'--')+' ppm; pre-FRC: '+(d.pre_frc_co2||'--')+' ppm; correction: '+"
+    "(d.correction_ppm===null?'--':d.correction_ppm)+' ppm; samples: '+d.samples;"
+    "if(d.samples>0)metrics+='; average: '+d.average_ppm+' ppm; range: '+d.minimum_ppm+'-'+d.maximum_ppm+"
+    "' ppm; in zone: '+d.in_zone_percent+'%; final: '+d.final_ppm+' ppm';"
+    "document.getElementById('recovery_metrics').textContent=metrics;"
+    "document.getElementById('recovery_start').disabled=d.active||d.repeat_blocked;"
+    "document.getElementById('recovery_cancel').disabled=!d.active||d.state==='calibrating';}catch(e){}}"
+    "setInterval(()=>{pollCo2Calibration();pollRecoveryTool()},1000);pollCo2Calibration();pollRecoveryTool();"
     "</script>"
     "</div></body></html>";
+  webServer.sendHeader("Cache-Control", "no-store");
   webServer.send(200, "text/html; charset=utf-8", html);
 }
 
@@ -4238,6 +4523,7 @@ void handleCo2CalibrationStart() {
   if (!startCo2CalibrationWorkflow(true, err, sizeof(err))) {
     int code = 500;
     if (strstr(err, "already running")) code = 409;
+    else if (strstr(err, "Recovery Tool")) code = 409;
     else if (strstr(err, "Wi-Fi is required")) code = 503;
     else if (strstr(err, "valid CO2")) code = 503;
     else if (strstr(err, "700-1200")) code = 502;
@@ -4284,6 +4570,122 @@ void handleCo2CalibrationStatus() {
 }
 
 // GET /syncntp — trigger NTP re-sync on next loop()
+void handleRecoveryToolStart() {
+  if (!webServer.hasArg("token") ||
+      webServer.arg("token") != String(recoveryCsrfToken)) {
+    webServer.send(403, "text/plain", "Invalid Recovery Tool request token.");
+    return;
+  }
+  if (!webServer.hasArg("confirmed") || webServer.arg("confirmed") != "true") {
+    webServer.send(400, "text/plain",
+                   "Outdoor placement and persistent-FRC confirmation are required.");
+    return;
+  }
+  char err[176];
+  if (!startRecoveryToolWorkflow(err, sizeof(err))) {
+    int code = 500;
+    if (strstr(err, "already running") || strstr(err, "before starting") ||
+        strstr(err, "outcome is unknown")) code = 409;
+    else if (strstr(err, "Wi-Fi") || strstr(err, "valid CO2")) code = 503;
+    else if (strstr(err, "700-1200")) code = 502;
+    webServer.send(code, "text/plain", err);
+    return;
+  }
+  webServer.send(202, "text/plain", recoveryToolMessage);
+}
+
+void handleRecoveryToolCancel() {
+  if (!webServer.hasArg("token") ||
+      webServer.arg("token") != String(recoveryCsrfToken)) {
+    webServer.send(403, "text/plain", "Invalid Recovery Tool request token.");
+    return;
+  }
+  if (recoveryTool.phase() == RecoveryPhase::FrcExecuting) {
+    webServer.send(409, "text/plain",
+                   "The one-time FRC is being written and cannot be cancelled.");
+    return;
+  }
+  if (!recoveryTool.active()) {
+    webServer.send(409, "text/plain", "Recovery Tool is not running.");
+    return;
+  }
+  bool frcWasApplied = recoveryTool.frcApplied();
+  recoveryTool.cancel();
+  refreshEffectivePowerMode();
+  snprintf(recoveryToolMessage, sizeof(recoveryToolMessage), "%s",
+           frcWasApplied
+             ? "Observation cancelled. The completed FRC remains stored in the SEN66."
+             : "Recovery cancelled before FRC; no calibration was written.");
+  Serial.printf("[RECOVERY] %s\n", recoveryToolMessage);
+  webServer.send(200, "text/plain", recoveryToolMessage);
+}
+
+void handleRecoveryToolStatus() {
+  uint32_t remainingSec = 0;
+  uint32_t elapsedSec = 0;
+  uint32_t now = millis();
+  if (recoveryTool.phase() != RecoveryPhase::Idle) {
+    elapsedSec = RecoveryToolState::elapsed(now, recoveryTool.startedMs()) / 1000U;
+  }
+  if (recoveryTool.phase() == RecoveryPhase::Conditioning) {
+    uint32_t elapsed = RecoveryToolState::elapsed(now, recoveryTool.startedMs());
+    remainingSec = elapsed >= RECOVERY_CONDITIONING_MS
+                     ? 0U
+                     : (RECOVERY_CONDITIONING_MS - elapsed + 999U) / 1000U;
+  } else if (recoveryTool.phase() == RecoveryPhase::Observing) {
+    uint32_t elapsed = RecoveryToolState::elapsed(
+      now, recoveryTool.observationStartedMs());
+    remainingSec = elapsed >= RECOVERY_OBSERVATION_MS
+                     ? 0U
+                     : (RECOVERY_OBSERVATION_MS - elapsed + 999U) / 1000U;
+  }
+
+  const RecoveryObservation& observation = recoveryTool.observation();
+  String liveCo2 = indoor.valid && indoor.co2 != 0xFFFF
+                     ? String(indoor.co2) : String("null");
+  String correction = recoveryTool.frcApplied()
+                        ? String((int32_t)recoveryTool.correctionRaw() - 0x8000)
+                        : String("null");
+  bool repeatBlocked = recoveryFrcOutcomeUncertain ||
+                       recoveryTool.frcOutcome() == RecoveryFrcOutcome::Unknown;
+  const char* frcOutcome = recoveryReportedFrcOutcome(
+    recoveryTool.frcOutcome(), recoveryFrcOutcomeUncertain);
+  String observedMin = observation.validSamples > 0
+                         ? String(observation.minimumPpm) : String("null");
+  String observedMax = observation.validSamples > 0
+                         ? String(observation.maximumPpm) : String("null");
+  String observedAverage = observation.validSamples > 0
+                             ? String(observation.averagePpm()) : String("null");
+  String observedFinal = observation.validSamples > 0
+                           ? String(observation.finalPpm) : String("null");
+
+  String json = "{\"state\":\"" +
+                String(recoveryPhaseName(recoveryTool.phase())) +
+                "\",\"active\":" +
+                String(recoveryTool.active() ? "true" : "false") +
+                ",\"remaining_sec\":" + String(remainingSec) +
+                ",\"elapsed_sec\":" + String(elapsedSec) +
+                ",\"co2\":" + liveCo2 +
+                ",\"pressure_hpa\":" + String(recoveryTool.pressureHpa()) +
+                ",\"initial_co2\":" + String(recoveryTool.initialCo2Ppm()) +
+                ",\"pre_frc_co2\":" + String(recoveryTool.preFrcCo2Ppm()) +
+                ",\"frc_applied\":" +
+                String(recoveryTool.frcApplied() ? "true" : "false") +
+                ",\"frc_outcome\":\"" + String(frcOutcome) + "\"" +
+                ",\"repeat_blocked\":" +
+                String(repeatBlocked ? "true" : "false") +
+                ",\"correction_ppm\":" + correction +
+                ",\"samples\":" + String(observation.validSamples) +
+                ",\"minimum_ppm\":" + observedMin +
+                ",\"maximum_ppm\":" + observedMax +
+                ",\"average_ppm\":" + observedAverage +
+                ",\"final_ppm\":" + observedFinal +
+                ",\"in_zone_percent\":" + String(observation.inZonePercent()) +
+                ",\"message\":\"" + String(recoveryToolMessage) + "\"}";
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(200, "application/json", json);
+}
+
 void handleSyncNTP() {
   webSyncNTP = true;
   webServer.send(200, "text/plain", "ok");
@@ -4760,6 +5162,9 @@ void startWebServer() {
   webServer.on("/co2cal/start", HTTP_POST, handleCo2CalibrationStart);
   webServer.on("/co2cal/cancel", HTTP_POST, handleCo2CalibrationCancel);
   webServer.on("/co2cal/status", HTTP_GET, handleCo2CalibrationStatus);
+  webServer.on("/recovery/start", HTTP_POST, handleRecoveryToolStart);
+  webServer.on("/recovery/cancel", HTTP_POST, handleRecoveryToolCancel);
+  webServer.on("/recovery/status", HTTP_GET, handleRecoveryToolStatus);
   webServer.on("/syncntp",     handleSyncNTP);
   webServer.on("/setsleep",      handleSetSleep);
   webServer.on("/wakenow",       handleWakeNow);
@@ -4819,11 +5224,11 @@ void serviceConnectivity() {
     return;
   }
 
-  // High-performance mode: while externally powered the radio stays on and
-  // online data refreshes every ten minutes instead of every thirty.
+  // High-performance mode: while externally powered or during Recovery Tool,
+  // the radio stays on and online data refreshes every ten minutes.
   unsigned long interval =
     ((long)(rainBoostUntilMs - now) > 0) ? WIFI_RAIN_MS :
-    (externalPowerLikely ? WIFI_EXTERNAL_MS : WIFI_NORMAL_MS);
+    (!lowPowerMode ? WIFI_EXTERNAL_MS : WIFI_NORMAL_MS);
   bool onlineUpdateDue =
     lastOnlineAttemptMs == 0 || now - lastOnlineAttemptMs >= interval;
 
@@ -4938,6 +5343,8 @@ void handleButtons() {
 void setup() {
   Serial.begin(115200);
   delay(200);
+  snprintf(recoveryCsrfToken, sizeof(recoveryCsrfToken), "%08lX%08lX",
+           (unsigned long)esp_random(), (unsigned long)esp_random());
   Serial.println("\n=== ESP32-S3 SEN66 WEATHER STATION ===");
   bootMillis = millis();
 
@@ -5044,6 +5451,7 @@ void loop() {
   }
 
   serviceConnectivity();
+  serviceRecoveryTool();
   serviceSen66Power();
   serviceFanCleaning();
   serviceShtc3();
@@ -5052,6 +5460,7 @@ void loop() {
     lastSensorReadMs = now;
     if (readSen66()) {
       sensorReadCount++;
+      if (indoor.co2 != 0xFFFF) recoveryTool.recordObservation(indoor.co2);
       Serial.printf("T=%.1fC RH=%.1f%% CO2=%u VOC=%.1f NOx=%.1f PM1=%.1f PM2.5=%.1f PM4=%.1f PM10=%.1f AQI=%d",
         indoor.temperature, indoor.humidity, indoor.co2, indoor.vocIndex, indoor.noxIndex,
         indoor.pm1, indoor.pm25, indoor.pm4, indoor.pm10, indoor.particleAqi);
