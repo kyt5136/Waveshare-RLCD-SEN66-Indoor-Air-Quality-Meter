@@ -6,16 +6,16 @@ The SEN66 supplies indoor temperature, humidity, CO2, VOC Index, NOx Index, and 
 
 WeatherAPI supplies forecasts, astronomy data, pressure, and location time data. OpenWeather supplies minute forecasts and outdoor air data.
 
-The 400 x 300 reflective LCD has 14 pages. A local web interface controls settings, pages, timers, alarms, and calibration.
+The 400 x 300 reflective LCD has 15 pages. A local web interface controls settings, pages, timers, alarms, and calibration. The newest firmware also provides an on-device maintenance page, PM warm-up protection, and SHTC3/SEN66 comparison logging.
 
 ## Engineering status
 
 - Target hardware: Waveshare ESP32-S3-RLCD-4.2
 - Application framework: Arduino-ESP32
-- Reference build date: 2026-07-29
+- Reference build date: 2026-08-03
 - Reference core: Espressif Arduino-ESP32 3.3.11
-- Reference binary size: 1,351,061 bytes
-- Reference dynamic allocation: 52,648 bytes of global data
+- Reference binary size: 1,407,385 bytes
+- Reference dynamic allocation: 52,944 bytes of global data
 - Display units: degrees Fahrenheit and miles per hour
 - Primary indoor sensor: Sensirion SEN66 at I2C address `0x6B`
 
@@ -57,6 +57,7 @@ Indoor particle AQI is calculated locally from the current PM2.5 and PM10 readin
 | 11 | System Information |
 | 12 | Complete SEN66 Output |
 | 13 | Timers, Stopwatch, and Alarms |
+| 14 | Settings: Wi-Fi, CO2 calibration, and SEN66 fan clean-out |
 
 The web interface stores a page-inclusion mask in NVS. Unchecked pages are skipped by both hardware-button navigation and automatic cycling. A page can still be selected directly from the web interface for inspection.
 
@@ -66,6 +67,7 @@ The ESP32 serves an unauthenticated HTTP interface on its LAN address. Available
 
 - immediate WeatherAPI and OpenWeather refresh
 - guarded outdoor SEN66 forced-CO2 recalibration using freshly downloaded local pressure
+- one-hour Recovery Tool with a 30-minute continuous conditioning period, one 400 ppm FRC, and a 30-minute observation report
 - immediate NTP synchronization
 - weather location replacement using decimal `latitude,longitude`
 - automatic LCD page cycling and dwell time
@@ -152,6 +154,8 @@ The display driver allocates its frame buffer and lookup tables in PSRAM. A buil
 | SEN66 read while active | 1 second |
 | SEN66 low-power duty cycle | 90 seconds per 10-minute slot |
 | SEN66 hourly conditioning | minute 50 through minute 59 |
+| Recovery Tool conditioning | 30 minutes continuous measurement |
+| Recovery Tool observation | 30 minutes continuous measurement after one FRC |
 | Battery ADC read | 10 seconds |
 | Temperature/humidity history sample | 15 minutes |
 | History capacity | 24 samples / 6 hours |
@@ -171,6 +175,7 @@ The display driver allocates its frame buffer and lookup tables in PSRAM. A buil
 - [Power, battery, and network control](docs/POWER_AND_NETWORK.md)
 - [ESP-IDF migration plan](docs/ESP_IDF_MIGRATION.md)
 - [Build, commissioning, and maintenance](docs/OPERATIONS.md)
+- [Maintenance, resilience, and on-device settings revision](docs/REVISION_2026-08-03.md)
 - [Documentation writing standard](docs/WRITING_STANDARD.md)
 - [Source provenance and third-party attribution](ATTRIBUTION.md)
 - [Security model](SECURITY.md)
@@ -191,5 +196,9 @@ No project-wide open-source license is asserted here because the immediate upstr
 - CO2, VOC, and NOx outputs require sensor startup and conditioning time.
 - Forced CO2 recalibration is persistent. Use the web workflow only with the
   complete SEN66 outdoors in a homogeneous, known 400 ppm reference environment.
+- Recovery Tool deliberately bypasses the normal 350-450 ppm prequalification
+  gate. It is a field-recovery aid for a persistently offset reading, not a
+  substitute for certified calibration gas or a reference instrument.
 - Battery state of charge uses voltage. It is not a coulomb-counted result.
+- The fan clean-out and smoothed, current-sample AQI are maintenance and trend tools; they do not make this a reference or life-safety monitor.
 - The web interface must not be exposed directly to the public internet.

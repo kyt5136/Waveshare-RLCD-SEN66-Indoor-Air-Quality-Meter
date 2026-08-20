@@ -1,5 +1,27 @@
 # Change Log
 
+## SEN66 CO2 Recovery Tool - 2026-08-20
+
+- Added a web-started one-hour Recovery Tool for persistently high outdoor CO2 readings.
+- Added a temporary high-power override that keeps the SEN66, display, Wi-Fi, and ESP32 runtime active without a connected USB host.
+- Added 30 minutes of continuous pressure-compensated conditioning before exactly one persistent 400 ppm FRC.
+- Added 30 minutes of continuous post-FRC observation with sample count, minimum, maximum, average, final value, and 350-450 ppm in-zone percentage.
+- Added cancellation and failure handling that reports whether the persistent FRC was already applied.
+- Added host-side state-machine tests for timing, one-shot FRC behavior, observation statistics, failure, and cancellation.
+
+## Maintenance, resilience, and on-device settings - 2026-08-03
+
+- Added startup I2C diagnostics and CRC-checked onboard SHTC3 sampling.
+- Added FATFS-backed six-hour history persistence and SEN66/SHTC3 comparison logging.
+- Added a 12-hour, 100-pair qualification gate before corrected SHTC3 fallback values are used during a stopped SEN66 duty window.
+- Added PM finite-value rejection, a 10-second post-start/fan-clean AQI gate, and PM2.5/PM10 exponential smoothing.
+- Added SEN66 fan clean-out control and a page-14 on-device settings menu.
+- Added NVS page-mask schema migration for the settings page.
+- Added USB-host based external-power behavior, a 60-second button-interaction display window, and 5 Hz RTC caching.
+- Added OpenWeather 15-minute data and one-time navigation to the minute page for new rain or severe-weather events.
+- Standardized display page headers and updated multiple page layouts.
+- Added full engineering and operating documentation for this revision.
+
 ## Power and weather revision - 2026-07-29
 
 - Replaced the battery ADC equation with calibrated millivolt sampling and the board divider ratio.

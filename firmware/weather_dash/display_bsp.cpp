@@ -116,7 +116,7 @@ void DisplayPort::RLCD_Init() {
   RLCD_SendData(0xE9);
 
   RLCD_SendCommand(0xB2);
-  RLCD_SendData(0x02);
+  RLCD_SendData(0x01);  // 0.5 Hz in low-power mode with D8 = 0x80
 
   RLCD_SendCommand(0xB3);
   RLCD_SendData(0xE5);
@@ -190,11 +190,16 @@ void DisplayPort::RLCD_Init() {
   RLCD_ColorClear(ColorWhite);
 }
 
+void DisplayPort::RLCD_SetPowerMode(bool highPower) {
+  RLCD_SendCommand(highPower ? 0x38 : 0x39);
+}
+
 void DisplayPort::RLCD_ColorClear(uint8_t color) {
   memset(DispBuffer, color, DisplayLen);
 }
 
 void DisplayPort::RLCD_Sleep() {
+  RLCD_SetPowerMode(true);
   RLCD_SendCommand(0x10);
   vTaskDelay(pdMS_TO_TICKS(120));
 }

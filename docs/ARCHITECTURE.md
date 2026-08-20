@@ -6,7 +6,7 @@ The firmware is a single Arduino sketch with local companion files. It deliberat
 
 The design is organized around five operating domains:
 
-1. acquisition of indoor SEN66 measurements.
+1. acquisition of indoor SEN66 measurements plus diagnostic/fallback SHTC3 readings.
 2. acquisition and reduction of WeatherAPI and OpenWeather data.
 3. timekeeping using NTP and the PCF85063A RTC.
 4. deterministic monochrome page rendering.
@@ -38,8 +38,8 @@ The implemented startup sequence is:
 9. start the embedded HTTP server.
 10. retrieve WeatherAPI and OpenWeather data.
 11. synchronize UTC from NTP and write location-local time to the RTC.
-12. acquire the first SEN66 measurement.
-13. initialize history buffers, battery state, and audio indications.
+12. acquire the first SEN66 measurement and SHTC3 comparison sample.
+13. mount FATFS, restore history/comparison state, and initialize battery state and audio indications.
 
 Failures are reported on Serial and reflected in display state. Wi-Fi or remote-weather failure does not prevent indoor sensing and local display operation.
 
@@ -53,9 +53,11 @@ The main Arduino loop is cooperative. There is no application-created FreeRTOS t
 | 10 s | battery ADC |
 | 15 min | temperature/humidity history insertion |
 | 30 min | WeatherAPI update |
-| 30 min | Normal OpenWeather update |
+| 30 min | Normal OpenWeather update: 1-minute timeline, 15-minute timeline, and air data |
 | 10 min | OpenWeather update during a two-hour rain event |
-| 2 s | Maximum LCD update rate |
+| 2 s | Maximum LCD update rate in low-power mode |
+| 250 ms | Maximum LCD update rate during USB power or the 60-second button-interaction window |
+| 30 min + one FRC + 30 min | Recovery Tool conditioning, calibration, and observation |
 | 24 h | NTP/RTC synchronization |
 | configurable | automatic page change |
 
@@ -65,9 +67,9 @@ The ESP32 networking and web-server implementation uses framework facilities und
 
 ### Indoor state
 
-`Sen66Data indoor` is the only authoritative indoor measurement record. It contains all processed SEN66 channels, calculated particle AQI, a valid flag, last-update time, and serial number.
+`Sen66Data indoor` is the authoritative complete indoor-air record. It contains all processed SEN66 channels, a filtered particle AQI, raw-to-filtered PM warm-up state, validity, last-update time, and serial number.
 
-Legacy scalar variables `temperature` and `humidity` mirror the latest SEN66 values for history-page compatibility. The onboard SHTC3 is not used as an indoor source.
+Legacy scalar variables `temperature` and `humidity` mirror the latest SEN66 values while measurement is active. The onboard SHTC3 is sampled separately for comparison and can supply a qualified, corrected temperature/humidity fallback while the SEN66 duty cycle is stopped. It never supplies particle, CO2, VOC, or NOx data.
 
 ### Outdoor state
 
@@ -76,7 +78,26 @@ forecast days, sunrise/sunset, pressure, update time, and validity.
 `HourlyData hourlyData` stores six forecast records. The WeatherAPI location
 object also updates the active IANA timezone, current UTC offset, and RTC.
 
+`OwmMinuteData owmMinute` stores the one-minute precipitation records plus the
+current 15-minute outside temperature, rain chance, and hashed alert state.
+New rain or changed severe-weather state may show page 5 once when that page is
+enabled.
+
 The WeatherAPI response is reduced immediately. the original JSON body is not retained after parsing.
+
+### Recovery state
+
+`RecoveryToolState recoveryTool` owns the volatile recovery phase, timestamps,
+pressure, initial/pre-FRC readings, one-time correction result, and observation
+accumulators. Its host-tested transition core emits only two actions: perform
+FRC after 30 minutes of conditioning and finish after 30 minutes of observation.
+
+The surrounding sketch owns I2C, WeatherAPI, web responses, Serial diagnostics,
+and the temporary power override. Ordinary Recovery Tool progress is not stored
+in NVS; restart returns to idle. A separate `rec_frc_unknown` safety latch is
+persisted immediately before FRC and cleared only after a definitive sensor
+response. Standard calibration, Recovery Tool, and fan cleaning are mutually
+exclusive because they share the SEN66 measurement/idle transitions.
 
 ### Persistent state
 
@@ -97,7 +118,7 @@ The display schedule sends ST7305 sleep and wake commands. Low-power mode also u
 
 ## 7. Navigation
 
-There are 14 compiled pages. `pageEnabledMask` is a 14-bit inclusion mask:
+There are 15 compiled pages. `pageEnabledMask` is a 15-bit inclusion mask. Page 14 is the on-device settings menu:
 
 - hardware-button next/previous navigation calls `nextEnabledPage()`.
 - automatic cycling uses the same function.
@@ -118,6 +139,7 @@ Alarm and timer events can force the Timers page regardless of its navigation-ma
 | PSRAM allocation failure | driver assertion can halt startup |
 | Invalid web location | HTTP 400. previous location is retained |
 | Last page unchecked | HTTP 409. mask is not changed |
+| FATFS unavailable | comparison log and persistent history are unavailable; sensing and display continue |
 
 ## 9. Architectural constraints
 
